@@ -60,7 +60,7 @@ func (s *ApprovalProcessingCoreTestSuite) SetupTest() {
 	params := new(mockstate.Params)
 	s.State.On("Sealed").Return(unittest.StateSnapshotForKnownBlock(s.ParentBlock, nil)).Maybe()
 	s.State.On("Params").Return(params)
-	params.On("Root").Return(
+	params.On("FinalizedRoot").Return(
 		func() *flow.Header { return s.rootHeader },
 		func() error { return nil },
 	)
@@ -594,12 +594,13 @@ func (s *ApprovalProcessingCoreTestSuite) TestRequestPendingApprovals() {
 
 		prevResult = ir.Result
 
-		s.ChunksAssignment = chunks.NewAssignment()
+		assignmentBuilder := chunks.NewAssignmentBuilder()
 
 		for _, chunk := range ir.Result.Chunks {
 			// assign the verifier to this chunk
-			s.ChunksAssignment.Add(chunk, verifiers)
+			require.NoError(s.T(), assignmentBuilder.Add(chunk.Index, verifiers))
 		}
+		s.ChunksAssignment = assignmentBuilder.Build()
 
 		err := s.core.processIncorporatedResult(ir)
 		require.NoError(s.T(), err)

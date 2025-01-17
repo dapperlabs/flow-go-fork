@@ -12,6 +12,7 @@ import (
 
 	sdk "github.com/onflow/flow-go-sdk"
 	sdkcrypto "github.com/onflow/flow-go-sdk/crypto"
+
 	"github.com/onflow/flow-go/network"
 
 	"github.com/onflow/flow-go/module"
@@ -34,11 +35,10 @@ var (
 type BaseClient struct {
 	Log zerolog.Logger // default logger
 
-	ContractAddress string                  // contract address
-	FlowClient      module.SDKClientWrapper // flow access node client
+	FlowClient module.SDKClientWrapper // flow access node client
 
 	AccountAddress  sdk.Address      // account belonging to node interacting with the contract
-	AccountKeyIndex uint             // account key index
+	AccountKeyIndex uint32           // account key index
 	Signer          sdkcrypto.Signer // signer used to sign transactions
 }
 
@@ -47,14 +47,12 @@ func NewBaseClient(
 	log zerolog.Logger,
 	flowClient module.SDKClientWrapper,
 	accountAddress string,
-	accountKeyIndex uint,
+	accountKeyIndex uint32,
 	signer sdkcrypto.Signer,
-	contractAddress string,
 ) *BaseClient {
 
 	return &BaseClient{
 		Log:             log,
-		ContractAddress: contractAddress,
 		FlowClient:      flowClient,
 		AccountKeyIndex: accountKeyIndex,
 		Signer:          signer,

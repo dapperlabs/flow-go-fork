@@ -3,25 +3,28 @@ package computer
 import (
 	"context"
 	"fmt"
-	"time"
+	"sync"
 
+	"github.com/onflow/crypto/hash"
 	"github.com/rs/zerolog"
 	"go.opentelemetry.io/otel/attribute"
 	otelTrace "go.opentelemetry.io/otel/trace"
 
-	"github.com/onflow/flow-go/crypto/hash"
 	"github.com/onflow/flow-go/engine/execution"
 	"github.com/onflow/flow-go/engine/execution/computation/result"
 	"github.com/onflow/flow-go/engine/execution/utils"
 	"github.com/onflow/flow-go/fvm"
 	"github.com/onflow/flow-go/fvm/blueprints"
 	"github.com/onflow/flow-go/fvm/storage/derived"
+	"github.com/onflow/flow-go/fvm/storage/errors"
+	"github.com/onflow/flow-go/fvm/storage/logical"
 	"github.com/onflow/flow-go/fvm/storage/snapshot"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/module/executiondatasync/provider"
 	"github.com/onflow/flow-go/module/mempool/entity"
 	"github.com/onflow/flow-go/module/trace"
+	"github.com/onflow/flow-go/state/protocol"
 	"github.com/onflow/flow-go/utils/logging"
 )
 
@@ -30,8 +33,9 @@ const (
 )
 
 type collectionInfo struct {
-	blockId    flow.Identifier
-	blockIdStr string
+	blockId     flow.Identifier
+	blockIdStr  string
+	blockHeight uint64
 
 	collectionIndex int
 	*entity.CompleteCollection
@@ -39,7 +43,7 @@ type collectionInfo struct {
 	isSystemTransaction bool
 }
 
-type transactionRequest struct {
+type TransactionRequest struct {
 	collectionInfo
 
 	txnId    flow.Identifier
@@ -60,11 +64,11 @@ func newTransactionRequest(
 	txnIndex uint32,
 	txnBody *flow.TransactionBody,
 	lastTransactionInCollection bool,
-) transactionRequest {
+) TransactionRequest {
 	txnId := txnBody.ID()
 	txnIdStr := txnId.String()
 
-	return transactionRequest{
+	return TransactionRequest{
 		collectionInfo: collection,
 		txnId:          txnId,
 		txnIdStr:       txnIdStr,
@@ -106,14 +110,16 @@ type blockComputer struct {
 	log                   zerolog.Logger
 	systemChunkCtx        fvm.Context
 	committer             ViewCommitter
-	executionDataProvider *provider.Provider
+	executionDataProvider provider.Provider
 	signer                module.Local
 	spockHasher           hash.Hasher
 	receiptHasher         hash.Hasher
 	colResCons            []result.ExecutedCollectionConsumer
+	protocolState         protocol.SnapshotExecutionSubsetProvider
+	maxConcurrency        int
 }
 
-func SystemChunkContext(vmCtx fvm.Context, logger zerolog.Logger) fvm.Context {
+func SystemChunkContext(vmCtx fvm.Context, metrics module.ExecutionMetrics) fvm.Context {
 	return fvm.NewContextFromParent(
 		vmCtx,
 		fvm.WithContractDeploymentRestricted(false),
@@ -121,9 +127,11 @@ func SystemChunkContext(vmCtx fvm.Context, logger zerolog.Logger) fvm.Context {
 		fvm.WithAuthorizationChecksEnabled(false),
 		fvm.WithSequenceNumberCheckAndIncrementEnabled(false),
 		fvm.WithTransactionFeesEnabled(false),
-		fvm.WithServiceEventCollectionEnabled(),
 		fvm.WithEventCollectionSizeLimit(SystemChunkEventCollectionMaxSize),
 		fvm.WithMemoryAndInteractionLimitsDisabled(),
+		// only the system transaction is allowed to call the block entropy provider
+		fvm.WithRandomSourceHistoryCallAllowed(true),
+		fvm.WithMetricsReporter(metrics),
 	)
 }
 
@@ -136,10 +144,22 @@ func NewBlockComputer(
 	logger zerolog.Logger,
 	committer ViewCommitter,
 	signer module.Local,
-	executionDataProvider *provider.Provider,
+	executionDataProvider provider.Provider,
 	colResCons []result.ExecutedCollectionConsumer,
+	state protocol.SnapshotExecutionSubsetProvider,
+	maxConcurrency int,
 ) (BlockComputer, error) {
-	systemChunkCtx := SystemChunkContext(vmCtx, logger)
+	if maxConcurrency < 1 {
+		return nil, fmt.Errorf("invalid maxConcurrency: %d", maxConcurrency)
+	}
+
+	// this is a safeguard to prevent scripts from writing to the program cache on Execution nodes.
+	// writes are only allowed by transactions.
+	if vmCtx.AllowProgramCacheWritesInScripts {
+		return nil, fmt.Errorf("program cache writes are not allowed in scripts on Execution nodes")
+	}
+
+	systemChunkCtx := SystemChunkContext(vmCtx, metrics)
 	vmCtx = fvm.NewContextFromParent(
 		vmCtx,
 		fvm.WithMetricsReporter(metrics),
@@ -157,6 +177,8 @@ func NewBlockComputer(
 		spockHasher:           utils.NewSPOCKHasher(),
 		receiptHasher:         utils.NewExecutionReceiptHasher(),
 		colResCons:            colResCons,
+		protocolState:         state,
+		maxConcurrency:        maxConcurrency,
 	}, nil
 }
 
@@ -188,18 +210,18 @@ func (e *blockComputer) queueTransactionRequests(
 	blockId flow.Identifier,
 	blockIdStr string,
 	blockHeader *flow.Header,
-	derivedBlockData *derived.DerivedBlockData,
 	rawCollections []*entity.CompleteCollection,
 	systemTxnBody *flow.TransactionBody,
-	requestQueue chan transactionRequest,
+	requestQueue chan TransactionRequest,
+	numTxns int,
 ) {
 	txnIndex := uint32(0)
 
-	// TODO(patrick): remove derivedBlockData from context
 	collectionCtx := fvm.NewContextFromParent(
 		e.vmCtx,
 		fvm.WithBlockHeader(blockHeader),
-		fvm.WithDerivedBlockData(derivedBlockData))
+		fvm.WithProtocolStateSnapshot(e.protocolState.AtBlockID(blockId)),
+	)
 
 	for idx, collection := range rawCollections {
 		collectionLogger := collectionCtx.Logger.With().
@@ -212,6 +234,7 @@ func (e *blockComputer) queueTransactionRequests(
 		collectionInfo := collectionInfo{
 			blockId:             blockId,
 			blockIdStr:          blockIdStr,
+			blockHeight:         blockHeader.Height,
 			collectionIndex:     idx,
 			CompleteCollection:  collection,
 			isSystemTransaction: false,
@@ -227,23 +250,25 @@ func (e *blockComputer) queueTransactionRequests(
 				i == len(collection.Transactions)-1)
 			txnIndex += 1
 		}
-
 	}
 
-	// TODO(patrick): remove derivedBlockData from context
 	systemCtx := fvm.NewContextFromParent(
 		e.systemChunkCtx,
 		fvm.WithBlockHeader(blockHeader),
-		fvm.WithDerivedBlockData(derivedBlockData))
+		fvm.WithProtocolStateSnapshot(e.protocolState.AtBlockID(blockId)),
+	)
 	systemCollectionLogger := systemCtx.Logger.With().
 		Str("block_id", blockIdStr).
 		Uint64("height", blockHeader.Height).
 		Bool("system_chunk", true).
 		Bool("system_transaction", true).
+		Int("num_collections", len(rawCollections)).
+		Int("num_txs", numTxns).
 		Logger()
 	systemCollectionInfo := collectionInfo{
 		blockId:         blockId,
 		blockIdStr:      blockIdStr,
+		blockHeight:     blockHeader.Height,
 		collectionIndex: len(rawCollections),
 		CompleteCollection: &entity.CompleteCollection{
 			Transactions: []*flow.TransactionBody{systemTxnBody},
@@ -318,41 +343,46 @@ func (e *blockComputer) executeBlock(
 		parentBlockExecutionResultID,
 		block,
 		numTxns,
-		e.colResCons)
+		e.colResCons,
+		baseSnapshot,
+	)
 	defer collector.Stop()
 
-	requestQueue := make(chan transactionRequest, numTxns)
+	requestQueue := make(chan TransactionRequest, numTxns)
+
+	database := newTransactionCoordinator(
+		e.vm,
+		baseSnapshot,
+		derivedBlockData,
+		collector)
+
 	e.queueTransactionRequests(
 		blockId,
 		blockIdStr,
 		block.Block.Header,
-		derivedBlockData,
 		rawCollections,
 		systemTxn,
-		requestQueue)
+		requestQueue,
+		numTxns,
+	)
 	close(requestQueue)
 
-	snapshotTree := snapshot.NewSnapshotTree(baseSnapshot)
-	for request := range requestQueue {
-		txnExecutionSnapshot, output, err := e.executeTransaction(
+	wg := &sync.WaitGroup{}
+	wg.Add(e.maxConcurrency)
+
+	for i := 0; i < e.maxConcurrency; i++ {
+		go e.executeTransactions(
 			blockSpan,
-			request,
-			snapshotTree)
-		if err != nil {
-			prefix := ""
-			if request.isSystemTransaction {
-				prefix = "system "
-			}
+			database,
+			requestQueue,
+			wg)
+	}
 
-			return nil, fmt.Errorf(
-				"failed to execute %stransaction at txnIndex %v: %w",
-				prefix,
-				request.txnIndex,
-				err)
-		}
+	wg.Wait()
 
-		collector.AddTransactionResult(request, txnExecutionSnapshot, output)
-		snapshotTree = snapshotTree.Append(txnExecutionSnapshot)
+	err = database.Error()
+	if err != nil {
+		return nil, err
 	}
 
 	res, err := collector.Finalize(ctx)
@@ -369,19 +399,90 @@ func (e *blockComputer) executeBlock(
 	return res, nil
 }
 
+func (e *blockComputer) executeTransactions(
+	blockSpan otelTrace.Span,
+	database *transactionCoordinator,
+	requestQueue chan TransactionRequest,
+	wg *sync.WaitGroup,
+) {
+	defer wg.Done()
+
+	for request := range requestQueue {
+		attempt := 0
+		for {
+			request.ctx.Logger.Info().
+				Int("attempt", attempt).
+				Msg("executing transaction")
+
+			attempt += 1
+			err := e.executeTransaction(blockSpan, database, request, attempt)
+
+			if errors.IsRetryableConflictError(err) {
+				request.ctx.Logger.Info().
+					Int("attempt", attempt).
+					Str("conflict_error", err.Error()).
+					Msg("conflict detected. retrying transaction")
+				continue
+			}
+
+			if err != nil {
+				database.AbortAllOutstandingTransactions(err)
+				return
+			}
+
+			break // process next transaction
+		}
+	}
+}
+
 func (e *blockComputer) executeTransaction(
-	parentSpan otelTrace.Span,
-	request transactionRequest,
-	storageSnapshot snapshot.StorageSnapshot,
+	blockSpan otelTrace.Span,
+	database *transactionCoordinator,
+	request TransactionRequest,
+	attempt int,
+) error {
+	txn, err := e.executeTransactionInternal(
+		blockSpan,
+		database,
+		request,
+		attempt)
+	if err != nil {
+		prefix := ""
+		if request.isSystemTransaction {
+			prefix = "system "
+		}
+
+		snapshotTime := logical.Time(0)
+		if txn != nil {
+			snapshotTime = txn.SnapshotTime()
+		}
+
+		return fmt.Errorf(
+			"failed to execute %stransaction %v (%d@%d) for block %s "+
+				"at height %v: %w",
+			prefix,
+			request.txnIdStr,
+			request.txnIndex,
+			snapshotTime,
+			request.blockIdStr,
+			request.ctx.BlockHeader.Height,
+			err)
+	}
+
+	return nil
+}
+
+func (e *blockComputer) executeTransactionInternal(
+	blockSpan otelTrace.Span,
+	database *transactionCoordinator,
+	request TransactionRequest,
+	attempt int,
 ) (
-	*snapshot.ExecutionSnapshot,
-	fvm.ProcedureOutput,
+	*transaction,
 	error,
 ) {
-	startedAt := time.Now()
-
 	txSpan := e.tracer.StartSampledSpanFromParent(
-		parentSpan,
+		blockSpan,
 		request.txnId,
 		trace.EXEComputeTransaction)
 	txSpan.SetAttributes(
@@ -391,66 +492,52 @@ func (e *blockComputer) executeTransaction(
 	)
 	defer txSpan.End()
 
-	logger := e.log.With().
-		Str("tx_id", request.txnIdStr).
-		Uint32("tx_index", request.txnIndex).
-		Str("block_id", request.blockIdStr).
-		Uint64("height", request.ctx.BlockHeader.Height).
-		Bool("system_chunk", request.isSystemTransaction).
-		Bool("system_transaction", request.isSystemTransaction).
-		Logger()
-	logger.Info().Msg("executing transaction in fvm")
-
 	request.ctx = fvm.NewContextFromParent(request.ctx, fvm.WithSpan(txSpan))
 
-	executionSnapshot, output, err := e.vm.Run(
-		request.ctx,
-		request.TransactionProcedure,
-		storageSnapshot)
+	txn, err := database.NewTransaction(request, attempt)
 	if err != nil {
-		return nil, fvm.ProcedureOutput{}, fmt.Errorf(
-			"failed to execute transaction %v for block %s at height %v: %w",
-			request.txnIdStr,
-			request.blockIdStr,
-			request.ctx.BlockHeader.Height,
-			err)
+		return nil, err
+	}
+	defer txn.Cleanup()
+
+	err = txn.Preprocess()
+	if err != nil {
+		return txn, err
 	}
 
-	logger = logger.With().
-		Uint64("computation_used", output.ComputationUsed).
-		Uint64("memory_used", output.MemoryEstimate).
-		Int64("time_spent_in_ms", time.Since(startedAt).Milliseconds()).
-		Logger()
+	// Validating here gives us an opportunity to early abort/retry the
+	// transaction in case the conflict is detectable after preprocessing.
+	// This is strictly an optimization and hence we don't need to wait for
+	// updates (removing this validate call won't impact correctness).
+	err = txn.Validate()
+	if err != nil {
+		return txn, err
+	}
 
-	if output.Err != nil {
-		logger = logger.With().
-			Str("error_message", output.Err.Error()).
-			Uint16("error_code", uint16(output.Err.Code())).
-			Logger()
-		logger.Info().Msg("transaction execution failed")
+	err = txn.Execute()
+	if err != nil {
+		return txn, err
+	}
 
-		if request.isSystemTransaction {
-			// This log is used as the data source for an alert on grafana.
-			// The system_chunk_error field must not be changed without adding
-			// the corresponding changes in grafana.
-			// https://github.com/dapperlabs/flow-internal/issues/1546
-			logger.Error().
-				Bool("system_chunk_error", true).
-				Bool("system_transaction_error", true).
-				Bool("critical_error", true).
-				Msg("error executing system chunk transaction")
+	err = txn.Finalize()
+	if err != nil {
+		return txn, err
+	}
+
+	// Snapshot time smaller than execution time indicates there are outstanding
+	// transaction(s) that must be committed before this transaction can be
+	// committed.
+	for txn.SnapshotTime() < request.ExecutionTime() {
+		err = txn.WaitForUpdates()
+		if err != nil {
+			return txn, err
 		}
-	} else {
-		logger.Info().Msg("transaction executed successfully")
+
+		err = txn.Validate()
+		if err != nil {
+			return txn, err
+		}
 	}
 
-	e.metrics.ExecutionTransactionExecuted(
-		time.Since(startedAt),
-		output.ComputationUsed,
-		output.MemoryEstimate,
-		len(output.Events),
-		flow.EventsList(output.Events).ByteSize(),
-		output.Err != nil,
-	)
-	return executionSnapshot, output, nil
+	return txn, txn.Commit()
 }

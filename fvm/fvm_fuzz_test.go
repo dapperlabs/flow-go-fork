@@ -5,9 +5,11 @@ import (
 	"math"
 	"testing"
 
+	"github.com/onflow/cadence/stdlib"
 	"github.com/stretchr/testify/require"
 
 	"github.com/onflow/cadence"
+	"github.com/onflow/cadence/encoding/ccf"
 	jsoncdc "github.com/onflow/cadence/encoding/json"
 
 	"github.com/onflow/flow-go/engine/execution/testutil"
@@ -16,6 +18,7 @@ import (
 	"github.com/onflow/flow-go/fvm/errors"
 	"github.com/onflow/flow-go/fvm/meter"
 	"github.com/onflow/flow-go/fvm/storage/snapshot"
+	"github.com/onflow/flow-go/fvm/systemcontracts"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/utils/unittest"
 )
@@ -36,7 +39,7 @@ func FuzzTransactionComputationLimit(f *testing.F) {
 			// create the transaction
 			txBody := tt.createTxBody(t, tctx)
 			// set the computation limit
-			txBody.SetGasLimit(computationLimit)
+			txBody.SetComputeLimit(computationLimit)
 
 			// sign the transaction
 			err := testutil.SignEnvelope(
@@ -104,7 +107,7 @@ var fuzzTransactionTypes = []transactionType{
 		require: func(t *testing.T, tctx transactionTypeContext, results fuzzResults) {
 			// if there is an error, it should be computation exceeded
 			if results.output.Err != nil {
-				require.Len(t, results.output.Events, 3)
+				require.Len(t, results.output.Events, 5)
 				unittest.EnsureEventsIndexSeq(t, results.output.Events, tctx.chain.ChainID())
 				codes := []errors.ErrorCode{
 					errors.ErrCodeComputationLimitExceededError,
@@ -117,7 +120,11 @@ var fuzzTransactionTypes = []transactionType{
 			// fees should be deducted no matter the input
 			fees, deducted := getDeductedFees(t, tctx, results)
 			require.True(t, deducted, "Fees should be deducted.")
-			require.GreaterOrEqual(t, fees.ToGoValue().(uint64), fuzzTestsInclusionFees)
+			require.GreaterOrEqual(
+				t,
+				uint64(fees),
+				fuzzTestsInclusionFees,
+			)
 			unittest.EnsureEventsIndexSeq(t, results.output.Events, tctx.chain.ChainID())
 		},
 	},
@@ -149,7 +156,10 @@ var fuzzTransactionTypes = []transactionType{
 			// fees should be deducted no matter the input
 			fees, deducted := getDeductedFees(t, tctx, results)
 			require.True(t, deducted, "Fees should be deducted.")
-			require.GreaterOrEqual(t, fees.ToGoValue().(uint64), fuzzTestsInclusionFees)
+			require.GreaterOrEqual(t,
+				uint64(fees),
+				fuzzTestsInclusionFees,
+			)
 			unittest.EnsureEventsIndexSeq(t, results.output.Events, tctx.chain.ChainID())
 		},
 	},
@@ -178,7 +188,10 @@ var fuzzTransactionTypes = []transactionType{
 			// fees should be deducted no matter the input
 			fees, deducted := getDeductedFees(t, tctx, results)
 			require.True(t, deducted, "Fees should be deducted.")
-			require.GreaterOrEqual(t, fees.ToGoValue().(uint64), fuzzTestsInclusionFees)
+			require.GreaterOrEqual(t,
+				uint64(fees),
+				fuzzTestsInclusionFees,
+			)
 			unittest.EnsureEventsIndexSeq(t, results.output.Events, tctx.chain.ChainID())
 		},
 	},
@@ -207,7 +220,10 @@ var fuzzTransactionTypes = []transactionType{
 			// fees should be deducted no matter the input
 			fees, deducted := getDeductedFees(t, tctx, results)
 			require.True(t, deducted, "Fees should be deducted.")
-			require.GreaterOrEqual(t, fees.ToGoValue().(uint64), fuzzTestsInclusionFees)
+			require.GreaterOrEqual(t,
+				uint64(fees),
+				fuzzTestsInclusionFees,
+			)
 			unittest.EnsureEventsIndexSeq(t, results.output.Events, tctx.chain.ChainID())
 		},
 	},
@@ -219,22 +235,30 @@ const fuzzTestsInclusionFees = uint64(1_000)
 func getDeductedFees(tb testing.TB, tctx transactionTypeContext, results fuzzResults) (fees cadence.UFix64, deducted bool) {
 	tb.Helper()
 
+	sc := systemcontracts.SystemContractsForChain(tctx.chain.ChainID())
+
 	var ok bool
 	var feesDeductedEvent cadence.Event
 	for _, e := range results.output.Events {
-		if string(e.Type) == fmt.Sprintf("A.%s.FlowFees.FeesDeducted", environment.FlowFeesAddress(tctx.chain)) {
-			data, err := jsoncdc.Decode(nil, e.Payload)
+		if string(e.Type) == fmt.Sprintf("A.%s.FlowFees.FeesDeducted", sc.FlowFees.Address.Hex()) {
+			data, err := ccf.Decode(nil, e.Payload)
 			require.NoError(tb, err)
 			feesDeductedEvent, ok = data.(cadence.Event)
-			require.True(tb, ok, "Event payload should be of type cadence event.")
+			require.True(tb, ok, "Event payload should be of type cadence event")
 		}
 	}
 	if feesDeductedEvent.Type() == nil {
 		return 0, false
 	}
-	fees, ok = feesDeductedEvent.Fields[0].(cadence.UFix64)
-	require.True(tb, ok, "FeesDeducted[0] event should be of type cadence.UFix64.")
-	return fees, true
+
+	feesValue := cadence.SearchFieldByName(feesDeductedEvent, "amount")
+	require.IsType(tb,
+		cadence.UFix64(0),
+		feesValue,
+		"FeesDeducted event amount field should be of type cadence.UFix64",
+	)
+
+	return feesValue.(cadence.UFix64), true
 }
 
 func bootstrapFuzzStateAndTxContext(tb testing.TB) (bootstrappedVmTest, transactionTypeContext) {
@@ -246,7 +270,7 @@ func bootstrapFuzzStateAndTxContext(tb testing.TB) (bootstrappedVmTest, transact
 	bootstrappedVMTest, err := newVMTest().withBootstrapProcedureOptions(
 		fvm.WithTransactionFee(fvm.DefaultTransactionFees),
 		fvm.WithExecutionMemoryLimit(math.MaxUint32),
-		fvm.WithExecutionEffortWeights(mainnetExecutionEffortWeights),
+		fvm.WithExecutionEffortWeights(environment.MainnetExecutionEffortWeights),
 		fvm.WithExecutionMemoryWeights(meter.DefaultMemoryWeights),
 		fvm.WithMinimumStorageReservation(fvm.DefaultMinimumStorageReservation),
 		fvm.WithAccountCreationFee(fvm.DefaultAccountCreationFee),
@@ -276,11 +300,15 @@ func bootstrapFuzzStateAndTxContext(tb testing.TB) (bootstrappedVmTest, transact
 		accountCreatedEvents := filterAccountCreatedEvents(output.Events)
 
 		// read the address of the account created (e.g. "0x01" and convert it to flow.address)
-		data, err := jsoncdc.Decode(nil, accountCreatedEvents[0].Payload)
+		data, err := ccf.Decode(nil, accountCreatedEvents[0].Payload)
 		require.NoError(tb, err)
 
 		address = flow.ConvertAddress(
-			data.(cadence.Event).Fields[0].(cadence.Address))
+			cadence.SearchFieldByName(
+				data.(cadence.Event),
+				stdlib.AccountEventAddressParameter.Identifier,
+			).(cadence.Address),
+		)
 
 		// ==== Transfer tokens to new account ====
 		txBody = transferTokensTx(chain).

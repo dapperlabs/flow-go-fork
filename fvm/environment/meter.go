@@ -3,7 +3,8 @@ package environment
 import (
 	"context"
 
-	"github.com/onflow/cadence/runtime/common"
+	"github.com/onflow/cadence/common"
+	"github.com/onflow/cadence/runtime"
 
 	"github.com/onflow/flow-go/fvm/errors"
 	"github.com/onflow/flow-go/fvm/meter"
@@ -12,54 +13,71 @@ import (
 
 const (
 	// [2_000, 3_000) reserved for the FVM
-	ComputationKindHash                       = 2001
-	ComputationKindVerifySignature            = 2002
-	ComputationKindAddAccountKey              = 2003
-	ComputationKindAddEncodedAccountKey       = 2004
-	ComputationKindAllocateStorageIndex       = 2005
-	ComputationKindCreateAccount              = 2006
-	ComputationKindEmitEvent                  = 2007
-	ComputationKindGenerateUUID               = 2008
-	ComputationKindGetAccountAvailableBalance = 2009
-	ComputationKindGetAccountBalance          = 2010
-	ComputationKindGetAccountContractCode     = 2011
-	ComputationKindGetAccountContractNames    = 2012
-	ComputationKindGetAccountKey              = 2013
-	ComputationKindGetBlockAtHeight           = 2014
-	ComputationKindGetCode                    = 2015
-	ComputationKindGetCurrentBlockHeight      = 2016
-	_                                         = 2017
-	ComputationKindGetStorageCapacity         = 2018
-	ComputationKindGetStorageUsed             = 2019
-	ComputationKindGetValue                   = 2020
-	ComputationKindRemoveAccountContractCode  = 2021
-	ComputationKindResolveLocation            = 2022
-	ComputationKindRevokeAccountKey           = 2023
-	ComputationKindRevokeEncodedAccountKey    = 2024
-	_                                         = 2025
-	ComputationKindSetValue                   = 2026
-	ComputationKindUpdateAccountContractCode  = 2027
-	ComputationKindValidatePublicKey          = 2028
-	ComputationKindValueExists                = 2029
-	ComputationKindAccountKeysCount           = 2030
-	ComputationKindBLSVerifyPOP               = 2031
-	ComputationKindBLSAggregateSignatures     = 2032
-	ComputationKindBLSAggregatePublicKeys     = 2033
-	ComputationKindGetOrLoadProgram           = 2034
+	ComputationKindHash = 2001 + iota
+	ComputationKindVerifySignature
+	ComputationKindAddAccountKey
+	ComputationKindAddEncodedAccountKey
+	ComputationKindAllocateSlabIndex
+	ComputationKindCreateAccount
+	ComputationKindEmitEvent
+	ComputationKindGenerateUUID
+	ComputationKindGetAccountAvailableBalance
+	ComputationKindGetAccountBalance
+	ComputationKindGetAccountContractCode
+	ComputationKindGetAccountContractNames
+	ComputationKindGetAccountKey
+	ComputationKindGetBlockAtHeight
+	ComputationKindGetCode
+	ComputationKindGetCurrentBlockHeight
+	_
+	ComputationKindGetStorageCapacity
+	ComputationKindGetStorageUsed
+	ComputationKindGetValue
+	ComputationKindRemoveAccountContractCode
+	ComputationKindResolveLocation
+	ComputationKindRevokeAccountKey
+	_ // removed, DO NOT REUSE
+	_ // removed, DO NOT REUSE
+	ComputationKindSetValue
+	ComputationKindUpdateAccountContractCode
+	ComputationKindValidatePublicKey
+	ComputationKindValueExists
+	ComputationKindAccountKeysCount
+	ComputationKindBLSVerifyPOP
+	ComputationKindBLSAggregateSignatures
+	ComputationKindBLSAggregatePublicKeys
+	ComputationKindGetOrLoadProgram
+	ComputationKindGenerateAccountLocalID
+	ComputationKindGetRandomSourceHistory
+	ComputationKindEVMGasUsage
+	ComputationKindRLPEncoding
+	ComputationKindRLPDecoding
+	ComputationKindEncodeEvent
+	_
+	ComputationKindEVMEncodeABI
+	ComputationKindEVMDecodeABI
 )
 
-type Meter interface {
-	MeterComputation(common.ComputationKind, uint) error
-	ComputationUsed() (uint64, error)
-	ComputationIntensities() meter.MeteredComputationIntensities
+// MainnetExecutionEffortWeights are the execution effort weights as they are
+// on mainnet from crescendo spork
+var MainnetExecutionEffortWeights = meter.ExecutionEffortWeights{
+	common.ComputationKindStatement:          314,
+	common.ComputationKindLoop:               314,
+	common.ComputationKindFunctionInvocation: 314,
+	ComputationKindGetValue:                  162,
+	ComputationKindCreateAccount:             567534,
+	ComputationKindSetValue:                  153,
+	ComputationKindEVMGasUsage:               13,
+}
 
-	MeterMemory(usage common.MemoryUsage) error
-	MemoryUsed() (uint64, error)
+type Meter interface {
+	runtime.MeterInterface
+
+	ComputationIntensities() meter.MeteredComputationIntensities
+	ComputationAvailable(common.ComputationKind, uint) bool
 
 	MeterEmittedEvent(byteSize uint64) error
 	TotalEmittedEventBytes() uint64
-
-	InteractionUsed() (uint64, error)
 }
 
 type meterImpl struct {
@@ -81,6 +99,17 @@ func (meter *meterImpl) MeterComputation(
 
 func (meter *meterImpl) ComputationIntensities() meter.MeteredComputationIntensities {
 	return meter.txnState.ComputationIntensities()
+}
+
+func (meter *meterImpl) ComputationAvailable(
+	kind common.ComputationKind,
+	intensity uint,
+) bool {
+	return meter.txnState.ComputationAvailable(kind, intensity)
+}
+
+func (meter *meterImpl) ComputationRemaining(kind common.ComputationKind) uint {
+	return meter.txnState.ComputationRemaining(kind)
 }
 
 func (meter *meterImpl) ComputationUsed() (uint64, error) {

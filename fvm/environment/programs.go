@@ -4,11 +4,12 @@ import (
 	"fmt"
 
 	"github.com/hashicorp/go-multierror"
+	"golang.org/x/xerrors"
 
 	"github.com/onflow/cadence"
+	"github.com/onflow/cadence/common"
 	jsoncdc "github.com/onflow/cadence/encoding/json"
-	"github.com/onflow/cadence/runtime/common"
-	"github.com/onflow/cadence/runtime/interpreter"
+	"github.com/onflow/cadence/interpreter"
 
 	"github.com/onflow/flow-go/fvm/errors"
 	"github.com/onflow/flow-go/fvm/storage"
@@ -17,6 +18,22 @@ import (
 	"github.com/onflow/flow-go/fvm/tracing"
 	"github.com/onflow/flow-go/module/trace"
 )
+
+type ProgramLoadingError struct {
+	Err      error
+	Location common.Location
+}
+
+func (p ProgramLoadingError) Unwrap() error {
+	return p.Err
+}
+
+var _ error = ProgramLoadingError{}
+var _ xerrors.Wrapper = ProgramLoadingError{}
+
+func (p ProgramLoadingError) Error() string {
+	return fmt.Sprintf("error getting program %v: %s", p.Location, p.Err)
+}
 
 // Programs manages operations around cadence program parsing.
 //
@@ -93,7 +110,6 @@ func (programs *Programs) getOrLoadAddressProgram(
 	location common.AddressLocation,
 	load func() (*interpreter.Program, error),
 ) (*interpreter.Program, error) {
-
 	top, err := programs.dependencyStack.top()
 	if err != nil {
 		return nil, err
@@ -127,7 +143,10 @@ func (programs *Programs) getOrLoadAddressProgram(
 		loader,
 	)
 	if err != nil {
-		return nil, fmt.Errorf("error getting program: %w", err)
+		return nil, ProgramLoadingError{
+			Err:      err,
+			Location: location,
+		}
 	}
 
 	// Add dependencies to the stack.
@@ -220,7 +239,7 @@ func newProgramLoader(
 }
 
 func (loader *programLoader) Compute(
-	txState state.NestedTransactionPreparer,
+	_ state.NestedTransactionPreparer,
 	location common.AddressLocation,
 ) (
 	*derived.Program,
@@ -270,7 +289,7 @@ func (loader *programLoader) loadWithDependencyTracking(
 	error,
 ) {
 	// this program is not in cache, so we need to load it into the cache.
-	// tho have proper invalidation, we need to track the dependencies of the program.
+	// to have proper invalidation, we need to track the dependencies of the program.
 	// If this program depends on another program,
 	// that program will be loaded before this one finishes loading (calls set).
 	// That is why this is a stack.
@@ -280,7 +299,13 @@ func (loader *programLoader) loadWithDependencyTracking(
 
 	// Get collected dependencies of the loaded program.
 	// Pop the dependencies from the stack even if loading errored.
-	stackLocation, dependencies, depErr := loader.dependencyStack.pop()
+	//
+	// In case of an error, the dependencies of the errored program should not be merged
+	// into the dependencies of the parent program. This is to prevent the parent program
+	// from thinking that this program was already loaded and is in the cache,
+	// if it requests it again.
+	merge := err == nil
+	stackLocation, dependencies, depErr := loader.dependencyStack.pop(merge)
 	if depErr != nil {
 		err = multierror.Append(err, depErr).ErrorOrNil()
 	}
@@ -371,7 +396,9 @@ func (s *dependencyStack) add(dependencies derived.ProgramDependencies) error {
 }
 
 // pop the last dependencies on the stack and return them.
-func (s *dependencyStack) pop() (common.Location, derived.ProgramDependencies, error) {
+// if merge is false then the dependencies are not merged into the parent tracker.
+// this is used to pop the dependencies of a program that errored during loading.
+func (s *dependencyStack) pop(merge bool) (common.Location, derived.ProgramDependencies, error) {
 	if len(s.trackers) <= 1 {
 		return nil,
 			derived.NewProgramDependencies(),
@@ -384,11 +411,13 @@ func (s *dependencyStack) pop() (common.Location, derived.ProgramDependencies, e
 	tracker := s.trackers[len(s.trackers)-1]
 	s.trackers = s.trackers[:len(s.trackers)-1]
 
-	// Add the dependencies of the popped tracker to the parent tracker
-	// This is an optimisation to avoid having to iterate through the entire stack
-	// everytime a dependency is pushed or added, instead we add the popped dependencies to the new top of the stack.
-	// (because if C depends on B which depends on A, A's dependencies include C).
-	s.trackers[len(s.trackers)-1].dependencies.Merge(tracker.dependencies)
+	if merge {
+		// Add the dependencies of the popped tracker to the parent tracker
+		// This is an optimisation to avoid having to iterate through the entire stack
+		// everytime a dependency is pushed or added, instead we add the popped dependencies to the new top of the stack.
+		// (because if C depends on B which depends on A, A's dependencies include C).
+		s.trackers[len(s.trackers)-1].dependencies.Merge(tracker.dependencies)
+	}
 
 	return tracker.location, tracker.dependencies, nil
 }

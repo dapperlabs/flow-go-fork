@@ -2,10 +2,8 @@ package badger
 
 import (
 	"math"
-	"math/rand"
 	"os"
 	"testing"
-	"time"
 
 	"github.com/dgraph-io/badger/v2"
 	"github.com/stretchr/testify/assert"
@@ -43,9 +41,6 @@ type SnapshotSuite struct {
 func (suite *SnapshotSuite) SetupTest() {
 	var err error
 
-	// seed the RNG
-	rand.Seed(time.Now().UnixNano())
-
 	suite.genesis = model.Genesis()
 	suite.chainID = suite.genesis.Header.ChainID
 
@@ -59,7 +54,7 @@ func (suite *SnapshotSuite) SetupTest() {
 	colPayloads := storage.NewClusterPayloads(metrics, suite.db)
 
 	root := unittest.RootSnapshotFixture(unittest.IdentityListFixture(5, unittest.WithAllRoles()))
-	suite.epochCounter = root.Encodable().Epochs.Current.Counter
+	suite.epochCounter = root.Encodable().SealingSegment.LatestProtocolStateEntry().EpochEntry.EpochCounter()
 
 	suite.protoState, err = pbadger.Bootstrap(
 		metrics,
@@ -71,7 +66,8 @@ func (suite *SnapshotSuite) SetupTest() {
 		all.QuorumCertificates,
 		all.Setups,
 		all.EpochCommits,
-		all.Statuses,
+		all.EpochProtocolStateEntries,
+		all.ProtocolKVStore,
 		all.VersionBeacons,
 		root,
 	)
@@ -295,8 +291,6 @@ func (suite *SnapshotSuite) TestPending_Grandchildren() {
 }
 
 func (suite *SnapshotSuite) TestParams_ChainID() {
-
-	chainID, err := suite.state.Params().ChainID()
-	suite.Require().Nil(err)
+	chainID := suite.state.Params().ChainID()
 	suite.Assert().Equal(suite.genesis.Header.ChainID, chainID)
 }

@@ -5,7 +5,6 @@ import (
 	"fmt"
 	"math/rand"
 	"testing"
-	"time"
 
 	"github.com/onflow/flow-go/module/signature"
 
@@ -31,14 +30,14 @@ type ProposalSuite struct {
 	suite.Suite
 	participants flow.IdentityList
 	indices      []byte
-	leader       *flow.Identity
+	leader       *flow.IdentitySkeleton
 	finalized    uint64
 	parent       *model.Block
 	block        *model.Block
-	voters       flow.IdentityList
-	proposal     *model.Proposal
+	voters       flow.IdentitySkeletonList
+	proposal     *model.SignedProposal
 	vote         *model.Vote
-	voter        *flow.Identity
+	voter        *flow.IdentitySkeleton
 	committee    *mocks.Replicas
 	verifier     *mocks.Verifier
 	validator    *Validator
@@ -46,10 +45,9 @@ type ProposalSuite struct {
 
 func (ps *ProposalSuite) SetupTest() {
 	// the leader is a random node for now
-	rand.Seed(time.Now().UnixNano())
 	ps.finalized = uint64(rand.Uint32() + 1)
-	ps.participants = unittest.IdentityListFixture(8, unittest.WithRole(flow.RoleConsensus))
-	ps.leader = ps.participants[0]
+	ps.participants = unittest.IdentityListFixture(8, unittest.WithRole(flow.RoleConsensus)).Sort(flow.Canonical[flow.Identity])
+	ps.leader = &ps.participants[0].IdentitySkeleton
 
 	// the parent is the last finalized block, followed directly by a block from the leader
 	ps.parent = helper.MakeBlock(
@@ -71,23 +69,23 @@ func (ps *ProposalSuite) SetupTest() {
 	voterIDs, err := signature.DecodeSignerIndicesToIdentifiers(ps.participants.NodeIDs(), ps.block.QC.SignerIndices)
 	require.NoError(ps.T(), err)
 
-	ps.voters = ps.participants.Filter(filter.HasNodeID(voterIDs...))
-	ps.proposal = &model.Proposal{Block: ps.block}
+	ps.voters = ps.participants.Filter(filter.HasNodeID[flow.Identity](voterIDs...)).ToSkeleton()
+	ps.proposal = helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(helper.WithBlock(ps.block))))
 	ps.vote = ps.proposal.ProposerVote()
 	ps.voter = ps.leader
 
 	// set up the mocked hotstuff Replicas state
 	ps.committee = &mocks.Replicas{}
 	ps.committee.On("LeaderForView", ps.block.View).Return(ps.leader.NodeID, nil)
-	ps.committee.On("QuorumThresholdForView", mock.Anything).Return(committees.WeightThresholdToBuildQC(ps.participants.TotalWeight()), nil)
+	ps.committee.On("QuorumThresholdForView", mock.Anything).Return(committees.WeightThresholdToBuildQC(ps.participants.ToSkeleton().TotalWeight()), nil)
 	ps.committee.On("IdentitiesByEpoch", mock.Anything).Return(
-		func(_ uint64) flow.IdentityList {
-			return ps.participants
+		func(_ uint64) flow.IdentitySkeletonList {
+			return ps.participants.ToSkeleton()
 		},
 		nil,
 	)
 	for _, participant := range ps.participants {
-		ps.committee.On("IdentityByEpoch", mock.Anything, participant.NodeID).Return(participant, nil)
+		ps.committee.On("IdentityByEpoch", mock.Anything, participant.NodeID).Return(&participant.IdentitySkeleton, nil)
 	}
 
 	// set up the mocked verifier
@@ -154,7 +152,7 @@ func (ps *ProposalSuite) TestProposalWrongLeader() {
 	// change the hotstuff.Replicas to return a different leader
 	*ps.committee = mocks.Replicas{}
 	ps.committee.On("LeaderForView", ps.block.View).Return(ps.participants[1].NodeID, nil)
-	for _, participant := range ps.participants {
+	for _, participant := range ps.participants.ToSkeleton() {
 		ps.committee.On("IdentityByEpoch", mock.Anything, participant.NodeID).Return(participant, nil)
 	}
 
@@ -258,7 +256,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 	ps.committee.On("LeaderForView", mock.Anything).Return(ps.leader.NodeID, nil)
 
 	ps.Run("happy-path", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -269,14 +267,14 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCSigners(ps.indices),
 				helper.WithTCView(ps.block.View+1),
 				helper.WithTCNewestQC(ps.block.QC))),
-		)
+		)))
 		ps.verifier.On("VerifyTC", ps.voters, []byte(proposal.LastViewTC.SigData),
 			proposal.LastViewTC.View, proposal.LastViewTC.NewestQCViews).Return(nil).Once()
 		err := ps.validator.ValidateProposal(proposal)
 		require.NoError(ps.T(), err)
 	})
 	ps.Run("no-tc", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -284,14 +282,14 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithBlockQC(ps.block.QC)),
 			),
 			// in this case proposal without LastViewTC is considered invalid
-		)
+		)))
 		err := ps.validator.ValidateProposal(proposal)
 		require.True(ps.T(), model.IsInvalidProposalError(err))
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyQC")
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyTC")
 	})
 	ps.Run("tc-for-wrong-view", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -302,14 +300,14 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCSigners(ps.indices),
 				helper.WithTCView(ps.block.View+10), // LastViewTC.View must be equal to Block.View-1
 				helper.WithTCNewestQC(ps.block.QC))),
-		)
+		)))
 		err := ps.validator.ValidateProposal(proposal)
 		require.True(ps.T(), model.IsInvalidProposalError(err))
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyQC")
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyTC")
 	})
 	ps.Run("proposal-not-safe-to-extend", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -321,14 +319,14 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCView(ps.block.View+1),
 				// proposal is not safe to extend because included QC.View is higher that Block.QC.View
 				helper.WithTCNewestQC(helper.MakeQC(helper.WithQCView(ps.block.View+1))))),
-		)
+		)))
 		err := ps.validator.ValidateProposal(proposal)
 		require.True(ps.T(), model.IsInvalidProposalError(err))
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyQC")
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyTC")
 	})
 	ps.Run("included-tc-highest-qc-not-highest", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -340,7 +338,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCView(ps.block.View+1),
 				helper.WithTCNewestQC(ps.block.QC),
 			)),
-		)
+		)))
 		ps.verifier.On("VerifyTC", ps.voters, []byte(proposal.LastViewTC.SigData),
 			proposal.LastViewTC.View, mock.Anything).Return(nil).Once()
 
@@ -354,7 +352,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 		// TC is signed by only one signer - insufficient to reach weight threshold
 		insufficientSignerIndices, err := signature.EncodeSignersToIndices(ps.participants.NodeIDs(), ps.participants.NodeIDs()[:1])
 		require.NoError(ps.T(), err)
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -366,7 +364,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCView(ps.block.View+1),
 				helper.WithTCNewestQC(ps.block.QC),
 			)),
-		)
+		)))
 		err = ps.validator.ValidateProposal(proposal)
 		require.True(ps.T(), model.IsInvalidProposalError(err) && model.IsInvalidTCError(err))
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyTC")
@@ -377,7 +375,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 			helper.WithQCView(ps.block.QC.View-1),
 			helper.WithQCSigners(ps.indices))
 
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -388,7 +386,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCSigners(ps.indices),
 				helper.WithTCView(ps.block.View+1),
 				helper.WithTCNewestQC(qc))),
-		)
+		)))
 		ps.verifier.On("VerifyTC", ps.voters, []byte(proposal.LastViewTC.SigData),
 			proposal.LastViewTC.View, proposal.LastViewTC.NewestQCViews).Return(nil).Once()
 		ps.verifier.On("VerifyQC", ps.voters, qc.SigData,
@@ -401,7 +399,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 			helper.WithQCView(ps.block.QC.View-2),
 			helper.WithQCSigners(ps.indices))
 
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -412,7 +410,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCSigners(ps.indices),
 				helper.WithTCView(ps.block.View+1),
 				helper.WithTCNewestQC(newestQC))),
-		)
+		)))
 		ps.verifier.On("VerifyTC", ps.voters, []byte(proposal.LastViewTC.SigData),
 			proposal.LastViewTC.View, proposal.LastViewTC.NewestQCViews).Return(nil).Once()
 		// Validating QC included in TC returns ErrViewForUnknownEpoch
@@ -425,7 +423,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 		require.NotErrorIs(ps.T(), err, model.ErrViewForUnknownEpoch)
 	})
 	ps.Run("included-tc-invalid-sig", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.block.View+2),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -436,7 +434,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithTCSigners(ps.indices),
 				helper.WithTCView(ps.block.View+1),
 				helper.WithTCNewestQC(ps.block.QC))),
-		)
+		)))
 		ps.verifier.On("VerifyTC", ps.voters, []byte(proposal.LastViewTC.SigData),
 			proposal.LastViewTC.View, proposal.LastViewTC.NewestQCViews).Return(model.ErrInvalidSignature).Once()
 		err := ps.validator.ValidateProposal(proposal)
@@ -445,7 +443,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 			proposal.LastViewTC.View, proposal.LastViewTC.NewestQCViews)
 	})
 	ps.Run("last-view-successful-but-includes-tc", func() {
-		proposal := helper.MakeProposal(
+		proposal := helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(
 			helper.WithBlock(helper.MakeBlock(
 				helper.WithBlockView(ps.finalized+1),
 				helper.WithBlockProposer(ps.leader.NodeID),
@@ -453,7 +451,7 @@ func (ps *ProposalSuite) TestProposalWithLastViewTC() {
 				helper.WithParentBlock(ps.parent)),
 			),
 			helper.WithLastViewTC(helper.MakeTC()),
-		)
+		)))
 		err := ps.validator.ValidateProposal(proposal)
 		require.True(ps.T(), model.IsInvalidProposalError(err))
 		ps.verifier.AssertNotCalled(ps.T(), "VerifyTC")
@@ -467,7 +465,7 @@ func TestValidateVote(t *testing.T) {
 
 type VoteSuite struct {
 	suite.Suite
-	signer    *flow.Identity
+	signer    *flow.IdentitySkeleton
 	block     *model.Block
 	vote      *model.Vote
 	verifier  *mocks.Verifier
@@ -478,7 +476,7 @@ type VoteSuite struct {
 func (vs *VoteSuite) SetupTest() {
 
 	// create a random signing identity
-	vs.signer = unittest.IdentityFixture(unittest.WithRole(flow.RoleConsensus))
+	vs.signer = &unittest.IdentityFixture(unittest.WithRole(flow.RoleConsensus)).IdentitySkeleton
 
 	// create a block that should be signed
 	vs.block = helper.MakeBlock()
@@ -572,8 +570,8 @@ func TestValidateQC(t *testing.T) {
 
 type QCSuite struct {
 	suite.Suite
-	participants flow.IdentityList
-	signers      flow.IdentityList
+	participants flow.IdentitySkeletonList
+	signers      flow.IdentitySkeletonList
 	block        *model.Block
 	qc           *flow.QuorumCertificate
 	committee    *mocks.Replicas
@@ -585,8 +583,8 @@ func (qs *QCSuite) SetupTest() {
 	// create a list of 10 nodes with 1-weight each
 	qs.participants = unittest.IdentityListFixture(10,
 		unittest.WithRole(flow.RoleConsensus),
-		unittest.WithWeight(1),
-	)
+		unittest.WithInitialWeight(1),
+	).Sort(flow.Canonical[flow.Identity]).ToSkeleton()
 
 	// signers are a qualified majority at 7
 	qs.signers = qs.participants[:7]
@@ -601,7 +599,7 @@ func (qs *QCSuite) SetupTest() {
 	// return the correct participants and identities from view state
 	qs.committee = &mocks.Replicas{}
 	qs.committee.On("IdentitiesByEpoch", mock.Anything).Return(
-		func(_ uint64) flow.IdentityList {
+		func(_ uint64) flow.IdentitySkeletonList {
 			return qs.participants
 		},
 		nil,
@@ -728,8 +726,8 @@ func TestValidateTC(t *testing.T) {
 
 type TCSuite struct {
 	suite.Suite
-	participants flow.IdentityList
-	signers      flow.IdentityList
+	participants flow.IdentitySkeletonList
+	signers      flow.IdentitySkeletonList
 	indices      []byte
 	block        *model.Block
 	tc           *flow.TimeoutCertificate
@@ -743,8 +741,8 @@ func (s *TCSuite) SetupTest() {
 	// create a list of 10 nodes with 1-weight each
 	s.participants = unittest.IdentityListFixture(10,
 		unittest.WithRole(flow.RoleConsensus),
-		unittest.WithWeight(1),
-	)
+		unittest.WithInitialWeight(1),
+	).Sort(flow.Canonical[flow.Identity]).ToSkeleton()
 
 	// signers are a qualified majority at 7
 	s.signers = s.participants[:7]
@@ -753,7 +751,6 @@ func (s *TCSuite) SetupTest() {
 	s.indices, err = signature.EncodeSignersToIndices(s.participants.NodeIDs(), s.signers.NodeIDs())
 	require.NoError(s.T(), err)
 
-	rand.Seed(time.Now().UnixNano())
 	view := uint64(int(rand.Uint32()) + len(s.participants))
 
 	highQCViews := make([]uint64, 0, len(s.signers))
@@ -778,7 +775,7 @@ func (s *TCSuite) SetupTest() {
 	// return the correct participants and identities from view state
 	s.committee = &mocks.DynamicCommittee{}
 	s.committee.On("IdentitiesByEpoch", mock.Anything, mock.Anything).Return(
-		func(view uint64) flow.IdentityList {
+		func(view uint64) flow.IdentitySkeletonList {
 			return s.participants
 		},
 		nil,

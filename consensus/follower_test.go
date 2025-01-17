@@ -17,6 +17,7 @@ import (
 	"github.com/onflow/flow-go/consensus/hotstuff/model"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module/irrecoverable"
+	"github.com/onflow/flow-go/module/metrics"
 	mockmodule "github.com/onflow/flow-go/module/mock"
 	"github.com/onflow/flow-go/module/signature"
 	mockstorage "github.com/onflow/flow-go/storage/mock"
@@ -74,7 +75,7 @@ type HotStuffFollowerSuite struct {
 // SetupTest initializes all the components needed for the Follower.
 // The follower itself is instantiated in method BeforeTest
 func (s *HotStuffFollowerSuite) SetupTest() {
-	identities := unittest.IdentityListFixture(4, unittest.WithRole(flow.RoleConsensus))
+	identities := unittest.IdentityListFixture(4, unittest.WithRole(flow.RoleConsensus)).Sort(flow.Canonical[flow.Identity])
 	s.mockConsensus = &MockConsensus{identities: identities}
 
 	// mock storage headers
@@ -116,6 +117,7 @@ func (s *HotStuffFollowerSuite) BeforeTest(suiteName, testName string) {
 	var err error
 	s.follower, err = consensus.NewFollower(
 		zerolog.New(os.Stderr),
+		metrics.NewNoopCollector(),
 		s.headers,
 		s.finalizer,
 		s.notifier,

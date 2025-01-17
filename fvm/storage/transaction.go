@@ -2,6 +2,7 @@ package storage
 
 import (
 	"github.com/onflow/flow-go/fvm/storage/derived"
+	"github.com/onflow/flow-go/fvm/storage/logical"
 	"github.com/onflow/flow-go/fvm/storage/snapshot"
 	"github.com/onflow/flow-go/fvm/storage/state"
 )
@@ -13,6 +14,9 @@ type TransactionPreparer interface {
 
 type Transaction interface {
 	TransactionPreparer
+
+	// SnapshotTime returns the transaction's current snapshot time.
+	SnapshotTime() logical.Time
 
 	// Finalize convert transaction preparer's intermediate state into
 	// committable state.
@@ -26,10 +30,4 @@ type Transaction interface {
 	// previously committed transactions, an error is returned and the
 	// transaction is not committed.
 	Commit() (*snapshot.ExecutionSnapshot, error)
-}
-
-// TODO(patrick): implement proper transaction.
-type SerialTransaction struct {
-	state.NestedTransactionPreparer
-	*derived.DerivedTransactionData
 }

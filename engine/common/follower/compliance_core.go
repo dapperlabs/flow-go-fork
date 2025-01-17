@@ -66,10 +66,6 @@ func NewComplianceCore(log zerolog.Logger,
 	sync module.BlockRequester,
 	tracer module.Tracer,
 ) (*ComplianceCore, error) {
-	onEquivocation := func(block, otherBlock *flow.Block) {
-		followerConsumer.OnDoubleProposeDetected(model.BlockFromFlow(block.Header), model.BlockFromFlow(otherBlock.Header))
-	}
-
 	finalizedBlock, err := state.Final().Head()
 	if err != nil {
 		return nil, fmt.Errorf("could not query finalized block: %w", err)
@@ -80,7 +76,7 @@ func NewComplianceCore(log zerolog.Logger,
 		mempoolMetrics:            mempoolMetrics,
 		state:                     state,
 		proposalViolationNotifier: followerConsumer,
-		pendingCache:              cache.NewCache(log, defaultPendingBlocksCacheCapacity, heroCacheCollector, onEquivocation),
+		pendingCache:              cache.NewCache(log, defaultPendingBlocksCacheCapacity, heroCacheCollector, followerConsumer),
 		pendingTree:               pending_tree.NewPendingTree(finalizedBlock),
 		follower:                  follower,
 		validator:                 validator,
@@ -115,7 +111,7 @@ func (c *ComplianceCore) OnBlockRange(originID flow.Identifier, batch []*flow.Bl
 
 	firstBlock := batch[0].Header
 	lastBlock := batch[len(batch)-1].Header
-	hotstuffProposal := model.ProposalFromFlow(lastBlock)
+	hotstuffProposal := model.SignedProposalFromFlow(lastBlock)
 	log := c.log.With().
 		Hex("origin_id", originID[:]).
 		Str("chain_id", lastBlock.ChainID.String()).
@@ -144,7 +140,10 @@ func (c *ComplianceCore) OnBlockRange(originID flow.Identifier, batch []*flow.Bl
 		err := c.validator.ValidateProposal(hotstuffProposal)
 		if err != nil {
 			if invalidBlockError, ok := model.AsInvalidProposalError(err); ok {
-				c.proposalViolationNotifier.OnInvalidBlockDetected(*invalidBlockError)
+				c.proposalViolationNotifier.OnInvalidBlockDetected(flow.Slashable[model.InvalidProposalError]{
+					OriginID: originID,
+					Message:  *invalidBlockError,
+				})
 				return nil
 			}
 			if errors.Is(err, model.ErrViewForUnknownEpoch) {
@@ -162,7 +161,11 @@ func (c *ComplianceCore) OnBlockRange(originID flow.Identifier, batch []*flow.Bl
 				//     a critical liveness assumption - see EpochCommitSafetyThreshold in protocol.Params for details.
 				//     -> In this case, it is ok for the protocol to halt. Consequently, we can just disregard
 				//        the block, which will probably lead to this node eventually halting.
-				log.Err(err).Msg("unable to validate proposal with view from unknown epoch")
+				log.Err(err).Msg(
+					"Unable to validate proposal with view from unknown epoch. While there is noting wrong with the node, " +
+						"this could be a symptom of (i) the node being severely behind, (ii) there is a byzantine proposer in " +
+						"the network, or (iii) there was no finalization progress for hundreds of views. This should be " +
+						"investigated to confirm the cause is the benign scenario (i).")
 				return nil
 			}
 			return fmt.Errorf("unexpected error validating proposal: %w", err)

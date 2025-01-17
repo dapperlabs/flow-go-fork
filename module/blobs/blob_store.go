@@ -4,9 +4,9 @@ import (
 	"context"
 	"errors"
 
+	"github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/go-cid"
 	"github.com/ipfs/go-datastore"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	ipld "github.com/ipfs/go-ipld-format"
 )
 
@@ -85,6 +85,10 @@ func (bs *blobstoreImpl) HashOnRead(enabled bool) {
 // NoopBlobstore is a Blobstore that does nothing, which is useful for calculating
 // BlockExecutionData IDs without storing the data.
 type NoopBlobstore struct{}
+
+func NewNoopBlobstore() *NoopBlobstore {
+	return &NoopBlobstore{}
+}
 
 func (n *NoopBlobstore) DeleteBlob(context.Context, cid.Cid) error {
 	return nil

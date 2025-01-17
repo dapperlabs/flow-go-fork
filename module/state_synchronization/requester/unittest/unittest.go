@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sync"
 
+	"github.com/ipfs/boxo/blockstore"
 	"github.com/ipfs/go-cid"
-	blockstore "github.com/ipfs/go-ipfs-blockstore"
 	"github.com/stretchr/testify/mock"
 
 	"github.com/onflow/flow-go/model/flow"
@@ -142,6 +142,25 @@ func WithByID(blocksByID map[flow.Identifier]*flow.Block) BlockHeaderMockOptions
 			func(blockID flow.Identifier) error {
 				if _, has := blocksByID[blockID]; !has {
 					return fmt.Errorf("block %s not found: %w", blockID, storage.ErrNotFound)
+				}
+				return nil
+			},
+		)
+	}
+}
+
+func WithBlockIDByHeight(blocksByHeight map[uint64]*flow.Block) BlockHeaderMockOptions {
+	return func(blocks *storagemock.Headers) {
+		blocks.On("BlockIDByHeight", mock.AnythingOfType("uint64")).Return(
+			func(height uint64) flow.Identifier {
+				if _, has := blocksByHeight[height]; !has {
+					return flow.ZeroID
+				}
+				return blocksByHeight[height].Header.ID()
+			},
+			func(height uint64) error {
+				if _, has := blocksByHeight[height]; !has {
+					return fmt.Errorf("block %d not found: %w", height, storage.ErrNotFound)
 				}
 				return nil
 			},

@@ -6,7 +6,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/onflow/cadence/runtime/common"
+	"github.com/onflow/cadence/common"
 	"github.com/stretchr/testify/require"
 
 	"github.com/onflow/flow-go/fvm"
@@ -43,34 +43,54 @@ var (
 	}
 
 	contractA0Code = `
-		pub contract A {
-			pub fun hello(): String {
+		access(all) contract A {
+			access(all) struct interface Foo{}
+			
+			access(all) fun hello(): String {
         		return "bad version"
     		}
 		}
 	`
 
 	contractACode = `
-		pub contract A {
-			pub fun hello(): String {
+		access(all) contract A {
+			access(all) struct interface Foo{}
+
+			access(all) fun hello(): String {
         		return "hello from A"
     		}
 		}
 	`
 
 	contractA2Code = `
-		pub contract A2 {
-			pub fun hello(): String {
+		access(all) contract A2 {
+			access(all) struct interface Foo{}
+
+			access(all) fun hello(): String {
         		return "hello from A2"
     		}
+		}
+	`
+
+	contractABreakingCode = `
+		access(all) contract A {
+			access(all) struct interface Foo{
+				access(all) fun hello()
+			}
+	
+			access(all) fun hello(): String {
+	  		return "hello from A with breaking change"
+			}
 		}
 	`
 
 	contractBCode = `
 		import 0xa
 
-		pub contract B {
-			pub fun hello(): String {
+		access(all) contract B {
+			access(all) struct Bar : A.Foo {}
+
+			access(all) fun hello(): String {
        			return "hello from B but also ".concat(A.hello())
     		}
 		}
@@ -80,8 +100,10 @@ var (
 		import B from 0xb
 		import A from 0xa
 
-		pub contract C {
-			pub fun hello(): String {
+		access(all) contract C {
+            access(all) struct Bar : A.Foo {}
+
+			access(all) fun hello(): String {
 	   			return "hello from C, ".concat(B.hello())
 			}
 		}
@@ -187,7 +209,7 @@ func Test_Programs(t *testing.T) {
 
 	})
 	t.Run("register touches are captured for simple contract A", func(t *testing.T) {
-		fmt.Println("---------- Real transaction here ------------")
+		t.Log("---------- Real transaction here ------------")
 
 		// run a TX using contract A
 
@@ -370,7 +392,7 @@ func Test_Programs(t *testing.T) {
 	})
 
 	t.Run("deploying new contract A2 invalidates B because of * imports", func(t *testing.T) {
-		// deploy contract B
+		// deploy contract A2
 		executionSnapshot, output, err := vm.Run(
 			context,
 			fvm.Transaction(
@@ -740,6 +762,79 @@ func Test_ProgramsDoubleCounting(t *testing.T) {
 		require.Equal(t, 0, metrics.CacheMisses)
 	})
 
+	t.Run("update A to breaking change and ensure cache state", func(t *testing.T) {
+		// deploy contract A
+		executionSnapshot, output, err := vm.Run(
+			context,
+			fvm.Transaction(
+				updateContractTx("A", contractABreakingCode, addressA),
+				derivedBlockData.NextTxIndexForTestingOnly()),
+			snapshotTree)
+		require.NoError(t, err)
+		require.NoError(t, output.Err)
+
+		snapshotTree = snapshotTree.Append(executionSnapshot)
+
+		entryA := derivedBlockData.GetProgramForTestingOnly(contractALocation)
+		entryB := derivedBlockData.GetProgramForTestingOnly(contractBLocation)
+		entryC := derivedBlockData.GetProgramForTestingOnly(contractCLocation)
+
+		require.Nil(t, entryA)
+		require.Nil(t, entryB)
+		require.Nil(t, entryC)
+
+		cached := derivedBlockData.CachedPrograms()
+		require.Equal(t, 1, cached)
+	})
+
+	callCAfterItsBroken := func(snapshotTree snapshot.SnapshotTree) snapshot.SnapshotTree {
+		procCallC := fvm.Transaction(
+			flow.NewTransactionBody().SetScript(
+				[]byte(
+					`
+					import A from 0xa
+					import B from 0xb
+					import C from 0xc
+					transaction {
+						prepare() {
+							log(C.hello())
+						}
+					}`,
+				)),
+			derivedBlockData.NextTxIndexForTestingOnly())
+
+		executionSnapshot, output, err := vm.Run(
+			context,
+			procCallC,
+			snapshotTree)
+		require.NoError(t, err)
+		require.Error(t, output.Err)
+
+		entryA := derivedBlockData.GetProgramForTestingOnly(contractALocation)
+		entryA2 := derivedBlockData.GetProgramForTestingOnly(contractA2Location)
+		entryB := derivedBlockData.GetProgramForTestingOnly(contractBLocation)
+		entryC := derivedBlockData.GetProgramForTestingOnly(contractCLocation)
+
+		require.NotNil(t, entryA)
+		require.NotNil(t, entryA2) // loaded due to "*" import in B
+		require.Nil(t, entryB)     // failed to load
+		require.Nil(t, entryC)     // failed to load
+
+		cached := derivedBlockData.CachedPrograms()
+		require.Equal(t, 2, cached)
+
+		return snapshotTree.Append(executionSnapshot)
+	}
+
+	t.Run("Call C when broken", func(t *testing.T) {
+		metrics.Reset()
+		snapshotTree = callCAfterItsBroken(snapshotTree)
+
+		// miss A, hit A, hit A2, hit A, hit A2, hit A
+		require.Equal(t, 5, metrics.CacheHits)
+		require.Equal(t, 1, metrics.CacheMisses)
+	})
+
 }
 
 func callTx(name string, address flow.Address) *flow.TransactionBody {
@@ -760,7 +855,7 @@ func contractDeployTx(name, code string, address flow.Address) *flow.Transaction
 
 	return flow.NewTransactionBody().SetScript(
 		[]byte(fmt.Sprintf(`transaction {
-              prepare(signer: AuthAccount) {
+              prepare(signer: auth(AddContract) &Account) {
                 signer.contracts.add(name: "%s", code: "%s".decodeHex())
               }
             }`, name, encoded)),
@@ -772,8 +867,8 @@ func updateContractTx(name, code string, address flow.Address) *flow.Transaction
 
 	return flow.NewTransactionBody().SetScript([]byte(
 		fmt.Sprintf(`transaction {
-             prepare(signer: AuthAccount) {
-               signer.contracts.update__experimental(name: "%s", code: "%s".decodeHex())
+             prepare(signer: auth(UpdateContract) &Account) {
+               signer.contracts.update(name: "%s", code: "%s".decodeHex())
              }
            }`, name, encoded)),
 	).AddAuthorizer(address)
@@ -797,6 +892,12 @@ func (m *metricsReporter) RuntimeTransactionChecked(duration time.Duration) {}
 func (m *metricsReporter) RuntimeTransactionInterpreted(duration time.Duration) {}
 
 func (m *metricsReporter) RuntimeSetNumberOfAccounts(count uint64) {}
+
+func (m *metricsReporter) SetNumberOfDeployedCOAs(count uint64) {}
+
+func (m *metricsReporter) EVMTransactionExecuted(_ uint64, _ bool, _ bool) {}
+
+func (m *metricsReporter) EVMBlockExecuted(_ int, _ uint64, _ float64) {}
 
 func (m *metricsReporter) RuntimeTransactionProgramsCacheMiss() {
 	m.CacheMisses++

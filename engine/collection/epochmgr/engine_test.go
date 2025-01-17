@@ -14,6 +14,7 @@ import (
 	"github.com/onflow/flow-go/consensus/hotstuff"
 	mockhotstuff "github.com/onflow/flow-go/consensus/hotstuff/mocks"
 	epochmgr "github.com/onflow/flow-go/engine/collection/epochmgr/mock"
+	mockcollection "github.com/onflow/flow-go/engine/collection/mock"
 	"github.com/onflow/flow-go/model/flow"
 	realmodule "github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/module/component"
@@ -45,7 +46,6 @@ type mockComponents struct {
 }
 
 func newMockComponents(t *testing.T) *mockComponents {
-
 	components := &mockComponents{
 		state:             cluster.NewState(t),
 		prop:              mockcomponent.NewComponent(t),
@@ -67,7 +67,9 @@ func newMockComponents(t *testing.T) *mockComponents {
 	components.voteAggregator.On("Start", mock.Anything)
 	components.timeoutAggregator.On("Start", mock.Anything)
 	components.messageHub.On("Start", mock.Anything)
-
+	params := cluster.NewParams(t)
+	params.On("ChainID").Return(flow.ChainID("chain-id"), nil).Maybe()
+	components.state.On("Params").Return(params).Maybe()
 	return components
 }
 
@@ -100,6 +102,8 @@ type Suite struct {
 	errs   <-chan error
 
 	engine *Engine
+
+	engineEventsDistributor *mockcollection.EngineEvents
 }
 
 // MockFactoryCreate mocks the epoch factory to create epoch components for the given epoch.
@@ -149,13 +153,14 @@ func (suite *Suite) SetupTest() {
 	suite.phase = flow.EpochPhaseSetup
 	suite.header = unittest.BlockHeaderFixture()
 	suite.epochQuery = mocks.NewEpochQuery(suite.T(), suite.counter)
+
 	suite.state.On("Final").Return(suite.snap)
 	suite.state.On("AtBlockID", suite.header.ID()).Return(suite.snap).Maybe()
 	suite.snap.On("Epochs").Return(suite.epochQuery)
 	suite.snap.On("Head").Return(
 		func() *flow.Header { return suite.header },
 		func() error { return nil })
-	suite.snap.On("Phase").Return(
+	suite.snap.On("EpochPhase").Return(
 		func() flow.EpochPhase { return suite.phase },
 		func() error { return nil })
 
@@ -167,9 +172,12 @@ func (suite *Suite) SetupTest() {
 		return herocache.NewTransactions(1000, suite.log, metrics.NewNoopCollector())
 	})
 
+	suite.engineEventsDistributor = mockcollection.NewEngineEvents(suite.T())
+
 	var err error
-	suite.engine, err = New(suite.log, suite.me, suite.state, suite.pools, suite.voter, suite.factory, suite.heights)
+	suite.engine, err = New(suite.log, suite.me, suite.state, suite.pools, suite.voter, suite.factory, suite.heights, suite.engineEventsDistributor)
 	suite.Require().Nil(err)
+
 }
 
 // StartEngine starts the engine under test, and spawns a routine to check for irrecoverable errors.
@@ -258,13 +266,16 @@ func (suite *Suite) MockAsUnauthorizedNode(forEpoch uint64) {
 	suite.MockFactoryCreate(mock.MatchedBy(authorizedMatcher))
 
 	var err error
-	suite.engine, err = New(suite.log, suite.me, suite.state, suite.pools, suite.voter, suite.factory, suite.heights)
+	suite.engine, err = New(suite.log, suite.me, suite.state, suite.pools, suite.voter, suite.factory, suite.heights, suite.engineEventsDistributor)
 	suite.Require().Nil(err)
 }
 
 // TestRestartInSetupPhase tests that, if we start up during the setup phase,
 // we should kick off the root QC voter
 func (suite *Suite) TestRestartInSetupPhase() {
+	// we expect 1 ActiveClustersChanged events when the engine first starts and the first set of epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
 	// we are in setup phase
 	suite.phase = flow.EpochPhaseSetup
 	// should call voter with next epoch
@@ -285,6 +296,9 @@ func (suite *Suite) TestRestartInSetupPhase() {
 // When the finalized height is within the first tx_expiry blocks of the new epoch
 // the engine should restart the previous epoch cluster consensus.
 func (suite *Suite) TestStartAfterEpochBoundary_WithinTxExpiry() {
+	// we expect 2 ActiveClustersChanged events once when the engine first starts and the first set of epoch components are started and on restart
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Twice()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
 	suite.phase = flow.EpochPhaseStaking
 	// transition epochs, so that a Previous epoch is queryable
 	suite.TransitionEpoch()
@@ -305,6 +319,9 @@ func (suite *Suite) TestStartAfterEpochBoundary_WithinTxExpiry() {
 // When the finalized height is beyond the first tx_expiry blocks of the new epoch
 // the engine should NOT restart the previous epoch cluster consensus.
 func (suite *Suite) TestStartAfterEpochBoundary_BeyondTxExpiry() {
+	// we expect 1 ActiveClustersChanged events when the engine first starts and the first set of epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
 	suite.phase = flow.EpochPhaseStaking
 	// transition epochs, so that a Previous epoch is queryable
 	suite.TransitionEpoch()
@@ -325,6 +342,9 @@ func (suite *Suite) TestStartAfterEpochBoundary_BeyondTxExpiry() {
 // boundary that we could start the previous epoch cluster consensus - however,
 // since we are not approved for the epoch, we should only start current epoch components.
 func (suite *Suite) TestStartAfterEpochBoundary_NotApprovedForPreviousEpoch() {
+	// we expect 1 ActiveClustersChanged events when the current epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
 	suite.phase = flow.EpochPhaseStaking
 	// transition epochs, so that a Previous epoch is queryable
 	suite.TransitionEpoch()
@@ -344,8 +364,11 @@ func (suite *Suite) TestStartAfterEpochBoundary_NotApprovedForPreviousEpoch() {
 // TestStartAfterEpochBoundary_NotApprovedForCurrentEpoch tests starting the engine
 // shortly after an epoch transition. The finalized boundary is near enough the epoch
 // boundary that we should start the previous epoch cluster consensus. However, we are
-// not approved for the current epoch -> we should only start *current* epoch components.
+// not approved for the current epoch -> we should only start *previous* epoch components.
 func (suite *Suite) TestStartAfterEpochBoundary_NotApprovedForCurrentEpoch() {
+	// we expect 1 ActiveClustersChanged events when the current epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
 	suite.phase = flow.EpochPhaseStaking
 	// transition epochs, so that a Previous epoch is queryable
 	suite.TransitionEpoch()
@@ -360,6 +383,26 @@ func (suite *Suite) TestStartAfterEpochBoundary_NotApprovedForCurrentEpoch() {
 	suite.StartEngine()
 	// only previous epoch components should have been started
 	suite.AssertEpochStarted(suite.counter - 1)
+	suite.Assert().Len(suite.components, 1)
+}
+
+// TestStartAfterEpochBoundary_PreviousEpochTransitionBeforeRoot tests starting the engine
+// with a root snapshot whose sealing segment excludes the last epoch boundary.
+// In this case we should only start up current-epoch components.
+func (suite *Suite) TestStartAfterEpochBoundary_PreviousEpochTransitionBeforeRoot() {
+	// we expect 1 ActiveClustersChanged events when the current epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
+	suite.phase = flow.EpochPhaseStaking
+	// transition epochs, so that a Previous epoch is queryable
+	suite.TransitionEpoch()
+	prevEpoch := suite.epochs[suite.counter-1]
+	// Previous epoch end boundary is unknown because it is before our root snapshot
+	prevEpoch.On("FinalHeight").Return(uint64(0), realprotocol.ErrUnknownEpochBoundary)
+
+	suite.StartEngine()
+	// only current epoch components should have been started
+	suite.AssertEpochStarted(suite.counter)
 	suite.Assert().Len(suite.components, 1)
 }
 
@@ -393,6 +436,10 @@ func (suite *Suite) TestStartAsUnauthorizedNode() {
 // TestRespondToPhaseChange should kick off root QC voter when we receive an event
 // indicating the EpochSetup phase has started.
 func (suite *Suite) TestRespondToPhaseChange() {
+	// we expect 1 ActiveClustersChanged events when the engine first starts and the first set of epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
+
 	// start in staking phase
 	suite.phase = flow.EpochPhaseStaking
 	// should call voter with next epoch
@@ -418,6 +465,13 @@ func (suite *Suite) TestRespondToPhaseChange() {
 //   - register callback to stop the previous epoch's cluster consensus
 //   - stop the previous epoch's cluster consensus when the callback is invoked
 func (suite *Suite) TestRespondToEpochTransition() {
+	// we expect 3 ActiveClustersChanged events
+	// - once when the engine first starts and the first set of epoch components are started
+	// - once when the epoch transitions and the new set of epoch components are started
+	// - once when the epoch transitions and the old set of epoch components are stopped
+	expectedNumOfEvents := 3
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Times(expectedNumOfEvents)
+	defer suite.engineEventsDistributor.AssertExpectations(suite.T())
 
 	// we are in committed phase
 	suite.phase = flow.EpochPhaseCommitted
@@ -477,4 +531,36 @@ func (suite *Suite) TestRespondToEpochTransition() {
 
 	// the expired epoch should have been stopped
 	suite.AssertEpochStopped(suite.counter - 1)
+}
+
+// TestStopQcVoting tests that, if we encounter an EpochEmergencyFallbackTriggered event
+// the engine will stop in progress QC voting. The engine keeps track of the current in progress
+// qc vote by keeping a pointer to the cancel func for the context of that process.
+// When the EFM event is encountered and voting is in progress the cancel func will be invoked
+// and the voting process will be stopped.
+func (suite *Suite) TestStopQcVoting() {
+	// we expect 1 ActiveClustersChanged events when the engine first starts and the first set of epoch components are started
+	suite.engineEventsDistributor.On("ActiveClustersChanged", mock.AnythingOfType("flow.ChainIDList")).Once()
+
+	receivedCancelSignal := make(chan struct{})
+	suite.voter.On("Vote", mock.Anything, suite.epochQuery.Next()).
+		Return(nil).
+		Run(func(args mock.Arguments) {
+			ctx := args.Get(0).(context.Context)
+			<-ctx.Done()
+			close(receivedCancelSignal)
+		}).Once()
+
+	// we are in setup phase, forces engine to start voting on startup
+	suite.phase = flow.EpochPhaseSetup
+
+	// start up the engine
+	suite.StartEngine()
+
+	require.NotNil(suite.T(), suite.engine.inProgressQCVote.Load(), "expected qc vote to be in progress")
+
+	// simulate processing efm triggered event, this should cancel all in progress voting
+	suite.engine.EpochEmergencyFallbackTriggered()
+
+	unittest.AssertClosesBefore(suite.T(), receivedCancelSignal, time.Second)
 }

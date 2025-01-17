@@ -3,13 +3,9 @@ package environment
 import (
 	"github.com/onflow/cadence"
 	"github.com/onflow/cadence/runtime"
-	"github.com/rs/zerolog"
-	otelTrace "go.opentelemetry.io/otel/trace"
 
 	reusableRuntime "github.com/onflow/flow-go/fvm/runtime"
-	"github.com/onflow/flow-go/fvm/tracing"
 	"github.com/onflow/flow-go/model/flow"
-	"github.com/onflow/flow-go/module/trace"
 )
 
 // Environment implements the accounts business logic and exposes cadence
@@ -17,13 +13,11 @@ import (
 type Environment interface {
 	runtime.Interface
 
-	// Tracer
-	StartChildSpan(
-		name trace.SpanName,
-		options ...otelTrace.SpanStartOption,
-	) tracing.TracerSpan
+	Tracer
 
 	Meter
+
+	MetricsReporter
 
 	// Runtime
 	BorrowCadenceRuntime() *reusableRuntime.ReusableCadenceRuntime
@@ -32,7 +26,7 @@ type Environment interface {
 	TransactionInfo
 
 	// ProgramLogger
-	Logger() *zerolog.Logger
+	LoggerProvider
 	Logs() []string
 
 	// EventEmitter
@@ -41,6 +35,8 @@ type Environment interface {
 	ConvertedServiceEvents() flow.ServiceEventList
 
 	// SystemContracts
+	ContractFunctionInvoker
+
 	AccountsStorageCapacity(
 		addresses []flow.Address,
 		payer flow.Address,
@@ -68,6 +64,12 @@ type Environment interface {
 
 	// AccountInfo
 	GetAccount(address flow.Address) (*flow.Account, error)
+	GetAccountKeys(address flow.Address) ([]flow.AccountPublicKey, error)
+
+	// RandomSourceHistory is the current block's derived random source.
+	// This source is only used by the core-contract that tracks the random source
+	// history for commit-reveal schemes.
+	RandomSourceHistory() ([]byte, error)
 
 	// FlushPendingUpdates flushes pending updates from the stateful environment
 	// modules (i.e., ContractUpdater) to the state transaction, and return
@@ -97,6 +99,10 @@ type EnvironmentParams struct {
 
 	BlockInfoParams
 	TransactionInfoParams
+	ScriptInfoParams
+
+	EntropyProvider
+	ExecutionVersionProvider
 
 	ContractUpdaterParams
 }
@@ -106,11 +112,16 @@ func DefaultEnvironmentParams() EnvironmentParams {
 		Chain:                 flow.Mainnet.Chain(),
 		ServiceAccountEnabled: true,
 
-		RuntimeParams:         DefaultRuntimeParams(),
-		ProgramLoggerParams:   DefaultProgramLoggerParams(),
-		EventEmitterParams:    DefaultEventEmitterParams(),
-		BlockInfoParams:       DefaultBlockInfoParams(),
-		TransactionInfoParams: DefaultTransactionInfoParams(),
-		ContractUpdaterParams: DefaultContractUpdaterParams(),
+		RuntimeParams:            DefaultRuntimeParams(),
+		ProgramLoggerParams:      DefaultProgramLoggerParams(),
+		EventEmitterParams:       DefaultEventEmitterParams(),
+		BlockInfoParams:          DefaultBlockInfoParams(),
+		TransactionInfoParams:    DefaultTransactionInfoParams(),
+		ContractUpdaterParams:    DefaultContractUpdaterParams(),
+		ExecutionVersionProvider: ZeroExecutionVersionProvider{},
 	}
+}
+
+func (env *EnvironmentParams) SetScriptInfoParams(info *ScriptInfoParams) {
+	env.ScriptInfoParams = *info
 }

@@ -18,6 +18,7 @@ import (
 	"github.com/onflow/flow-go/engine/common/follower"
 	followereng "github.com/onflow/flow-go/engine/common/follower"
 	commonsync "github.com/onflow/flow-go/engine/common/synchronization"
+	"github.com/onflow/flow-go/engine/execution/computation"
 	"github.com/onflow/flow-go/engine/verification/assigner"
 	"github.com/onflow/flow-go/engine/verification/assigner/blockconsumer"
 	"github.com/onflow/flow-go/engine/verification/fetcher"
@@ -29,7 +30,6 @@ import (
 	"github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/module/chainsync"
 	"github.com/onflow/flow-go/module/chunks"
-	modulecompliance "github.com/onflow/flow-go/module/compliance"
 	finalizer "github.com/onflow/flow-go/module/finalizer/consensus"
 	"github.com/onflow/flow-go/module/mempool"
 	"github.com/onflow/flow-go/module/mempool/stdmap"
@@ -195,14 +195,18 @@ func (v *VerificationNodeBuilder) LoadComponentsAndModules() {
 				[]fvm.Option{fvm.WithLogger(node.Logger)},
 				node.FvmOptions...,
 			)
+
+			// TODO(JanezP): cleanup creation of fvm context github.com/onflow/flow-go/issues/5249
+			fvmOptions = append(fvmOptions, computation.DefaultFVMOptions(node.RootChainID, false, false)...)
 			vmCtx := fvm.NewContext(fvmOptions...)
+
 			chunkVerifier := chunks.NewChunkVerifier(vm, vmCtx, node.Logger)
 			approvalStorage := badger.NewResultApprovals(node.Metrics.Cache, node.DB)
 			verifierEng, err = verifier.New(
 				node.Logger,
 				collector,
 				node.Tracer,
-				node.Network,
+				node.EngineRegistry,
 				node.State,
 				node.Me,
 				chunkVerifier,
@@ -215,7 +219,7 @@ func (v *VerificationNodeBuilder) LoadComponentsAndModules() {
 			requesterEngine, err = requester.New(
 				node.Logger,
 				node.State,
-				node.Network,
+				node.EngineRegistry,
 				node.Tracer,
 				collector,
 				chunkRequests,
@@ -246,13 +250,17 @@ func (v *VerificationNodeBuilder) LoadComponentsAndModules() {
 				v.verConf.stopAtHeight)
 
 			// requester and fetcher engines are started by chunk consumer
-			chunkConsumer = chunkconsumer.NewChunkConsumer(
+			chunkConsumer, err = chunkconsumer.NewChunkConsumer(
 				node.Logger,
 				collector,
 				processedChunkIndex,
 				chunkQueue,
 				fetcherEngine,
 				v.verConf.chunkWorkers)
+
+			if err != nil {
+				return nil, fmt.Errorf("could not create chunk consumer: %w", err)
+			}
 
 			err = node.Metrics.Mempool.Register(metrics.ResourceChunkConsumer, chunkConsumer.Size)
 			if err != nil {
@@ -337,10 +345,11 @@ func (v *VerificationNodeBuilder) LoadComponentsAndModules() {
 			// so that it gets notified upon each new finalized block
 			followerCore, err = flowconsensus.NewFollower(
 				node.Logger,
+				node.Metrics.Mempool,
 				node.Storage.Headers,
 				final,
 				followerDistributor,
-				node.RootBlock.Header,
+				node.FinalizedRootBlock.Header,
 				node.RootQC,
 				finalized,
 				pending,
@@ -379,35 +388,44 @@ func (v *VerificationNodeBuilder) LoadComponentsAndModules() {
 
 			followerEng, err = followereng.NewComplianceLayer(
 				node.Logger,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				node.Metrics.Engine,
 				node.Storage.Headers,
-				node.FinalizedHeader,
+				node.LastFinalizedHeader,
 				core,
-				followereng.WithComplianceConfigOpt(modulecompliance.WithSkipNewProposalsThreshold(node.ComplianceConfig.SkipNewProposalsThreshold)),
+				node.ComplianceConfig,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("could not create follower engine: %w", err)
 			}
+			followerDistributor.AddOnBlockFinalizedConsumer(followerEng.OnFinalizedBlock)
 
 			return followerEng, nil
 		}).
 		Component("sync engine", func(node *NodeConfig) (module.ReadyDoneAware, error) {
+			spamConfig, err := commonsync.NewSpamDetectionConfig()
+			if err != nil {
+				return nil, fmt.Errorf("could not initialize spam detection config: %w", err)
+			}
+
 			sync, err := commonsync.New(
 				node.Logger,
 				node.Metrics.Engine,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				node.State,
 				node.Storage.Blocks,
 				followerEng,
 				syncCore,
 				node.SyncEngineIdentifierProvider,
+				spamConfig,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("could not create synchronization engine: %w", err)
 			}
+			followerDistributor.AddFinalizationConsumer(sync)
+
 			return sync, nil
 		})
 }

@@ -3,12 +3,15 @@ package environment
 import (
 	"context"
 
-	"github.com/onflow/cadence/runtime/common"
-	"github.com/onflow/cadence/runtime/interpreter"
+	"github.com/onflow/cadence/ast"
+	"github.com/onflow/cadence/common"
+	"github.com/onflow/cadence/interpreter"
+	"github.com/onflow/cadence/sema"
 
 	"github.com/onflow/flow-go/fvm/storage"
 	"github.com/onflow/flow-go/fvm/storage/snapshot"
 	"github.com/onflow/flow-go/fvm/storage/state"
+	"github.com/onflow/flow-go/fvm/systemcontracts"
 	"github.com/onflow/flow-go/fvm/tracing"
 )
 
@@ -24,8 +27,9 @@ type facadeEnvironment struct {
 	*ProgramLogger
 	EventEmitter
 
-	UnsafeRandomGenerator
+	RandomGenerator
 	CryptoLibrary
+	RandomSourceHistoryProvider
 
 	BlockInfo
 	AccountInfo
@@ -34,8 +38,10 @@ type facadeEnvironment struct {
 	ValueStore
 
 	*SystemContracts
+	MinimumCadenceRequiredVersion
 
 	UUIDGenerator
+	AccountLocalIDGenerator
 
 	AccountCreator
 
@@ -59,11 +65,14 @@ func newFacadeEnvironment(
 	accounts := NewAccounts(txnState)
 	logger := NewProgramLogger(tracer, params.ProgramLoggerParams)
 	runtime := NewRuntime(params.RuntimeParams)
+	chain := params.Chain
 	systemContracts := NewSystemContracts(
-		params.Chain,
+		chain,
 		tracer,
 		logger,
 		runtime)
+
+	sc := systemcontracts.SystemContractsForChain(chain.ChainID())
 
 	env := &facadeEnvironment{
 		Runtime: runtime,
@@ -74,12 +83,8 @@ func newFacadeEnvironment(
 		ProgramLogger: logger,
 		EventEmitter:  NoEventEmitter{},
 
-		UnsafeRandomGenerator: NewUnsafeRandomGenerator(
-			tracer,
-			params.BlockHeader,
-			params.TxIndex,
-		),
-		CryptoLibrary: NewCryptoLibrary(tracer, meter),
+		CryptoLibrary:               NewCryptoLibrary(tracer, meter),
+		RandomSourceHistoryProvider: NewForbiddenRandomSourceHistoryProvider(),
 
 		BlockInfo: NewBlockInfo(
 			tracer,
@@ -103,11 +108,22 @@ func newFacadeEnvironment(
 		),
 
 		SystemContracts: systemContracts,
+		MinimumCadenceRequiredVersion: NewMinimumCadenceRequiredVersion(
+			params.ExecutionVersionProvider,
+		),
 
 		UUIDGenerator: NewUUIDGenerator(
 			tracer,
+			params.Logger,
 			meter,
-			txnState),
+			txnState,
+			params.BlockHeader,
+			params.TxIndex),
+		AccountLocalIDGenerator: NewAccountLocalIDGenerator(
+			tracer,
+			meter,
+			accounts,
+		),
 
 		AccountCreator: NoAccountCreator{},
 
@@ -122,6 +138,7 @@ func newFacadeEnvironment(
 			tracer,
 			meter,
 			accounts,
+			common.Address(sc.Crypto.Address),
 		),
 		ContractUpdater: NoContractUpdater{},
 		Programs: NewPrograms(
@@ -166,9 +183,12 @@ func NewScriptEnv(
 		params,
 		txnState,
 		NewCancellableMeter(ctx, txnState))
-
+	env.RandomGenerator = NewRandomGenerator(
+		tracer,
+		params.EntropyProvider,
+		params.ScriptInfoParams.ID[:],
+	)
 	env.addParseRestrictedChecks()
-
 	return env
 }
 
@@ -223,6 +243,19 @@ func NewTransactionEnvironment(
 		txnState,
 		env)
 
+	env.RandomGenerator = NewRandomGenerator(
+		tracer,
+		params.EntropyProvider,
+		params.TxId[:],
+	)
+
+	env.RandomSourceHistoryProvider = NewRandomSourceHistoryProvider(
+		tracer,
+		env.Meter,
+		params.EntropyProvider,
+		params.TransactionInfoParams.RandomSourceHistoryCallAllowed,
+	)
+
 	env.addParseRestrictedChecks()
 
 	return env
@@ -263,12 +296,18 @@ func (env *facadeEnvironment) addParseRestrictedChecks() {
 	env.TransactionInfo = NewParseRestrictedTransactionInfo(
 		env.txnState,
 		env.TransactionInfo)
-	env.UnsafeRandomGenerator = NewParseRestrictedUnsafeRandomGenerator(
+	env.RandomGenerator = NewParseRestrictedRandomGenerator(
 		env.txnState,
-		env.UnsafeRandomGenerator)
+		env.RandomGenerator)
+	env.RandomSourceHistoryProvider = NewParseRestrictedRandomSourceHistoryProvider(
+		env.txnState,
+		env.RandomSourceHistoryProvider)
 	env.UUIDGenerator = NewParseRestrictedUUIDGenerator(
 		env.txnState,
 		env.UUIDGenerator)
+	env.AccountLocalIDGenerator = NewParseRestrictedAccountLocalIDGenerator(
+		env.txnState,
+		env.AccountLocalIDGenerator)
 	env.ValueStore = NewParseRestrictedValueStore(
 		env.txnState,
 		env.ValueStore)
@@ -287,19 +326,64 @@ func (env *facadeEnvironment) Reset() {
 	env.Programs.Reset()
 }
 
-// Miscellaneous cadence runtime.Interface API.
-func (facadeEnvironment) ResourceOwnerChanged(
+// Miscellaneous Cadence runtime.Interface API
+
+func (*facadeEnvironment) ResourceOwnerChanged(
 	*interpreter.Interpreter,
 	*interpreter.CompositeValue,
 	common.Address,
 	common.Address,
 ) {
-}
-
-func (env *facadeEnvironment) SetInterpreterSharedState(state *interpreter.SharedState) {
 	// NO-OP
 }
 
-func (env *facadeEnvironment) GetInterpreterSharedState() *interpreter.SharedState {
+func (*facadeEnvironment) SetInterpreterSharedState(_ *interpreter.SharedState) {
+	// NO-OP
+}
+
+func (*facadeEnvironment) GetInterpreterSharedState() *interpreter.SharedState {
+	// NO-OP
 	return nil
+}
+
+func (env *facadeEnvironment) RecoverProgram(program *ast.Program, location common.Location) ([]byte, error) {
+	return RecoverProgram(
+		env.chain.ChainID(),
+		program,
+		location,
+	)
+}
+
+func (env *facadeEnvironment) ValidateAccountCapabilitiesGet(
+	_ *interpreter.Interpreter,
+	_ interpreter.LocationRange,
+	_ interpreter.AddressValue,
+	_ interpreter.PathValue,
+	wantedBorrowType *sema.ReferenceType,
+	_ *sema.ReferenceType,
+) (bool, error) {
+	_, hasEntitlements := wantedBorrowType.Authorization.(sema.EntitlementSetAccess)
+	if hasEntitlements {
+		// TODO: maybe abort
+		//return false, interpreter.GetCapabilityError{
+		//	LocationRange: locationRange,
+		//}
+		return false, nil
+	}
+	return true, nil
+}
+
+func (env *facadeEnvironment) ValidateAccountCapabilitiesPublish(
+	_ *interpreter.Interpreter,
+	_ interpreter.LocationRange,
+	_ interpreter.AddressValue,
+	_ interpreter.PathValue,
+	capabilityBorrowType *interpreter.ReferenceStaticType,
+) (bool, error) {
+	_, isEntitledCapability := capabilityBorrowType.Authorization.(interpreter.EntitlementSetAuthorization)
+	if isEntitledCapability {
+		// TODO: maybe abort
+		return false, nil
+	}
+	return true, nil
 }

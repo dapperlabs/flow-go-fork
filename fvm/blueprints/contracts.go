@@ -3,25 +3,23 @@ package blueprints
 import (
 	_ "embed"
 
-	"encoding/hex"
-
 	"github.com/onflow/cadence"
+	"github.com/onflow/cadence/common"
 	jsoncdc "github.com/onflow/cadence/encoding/json"
-	"github.com/onflow/cadence/runtime/common"
 
 	"github.com/onflow/flow-go/model/flow"
 )
 
 var ContractDeploymentAuthorizedAddressesPath = cadence.Path{
-	Domain:     common.PathDomainStorage.Identifier(),
+	Domain:     common.PathDomainStorage,
 	Identifier: "authorizedAddressesToDeployContracts",
 }
 var ContractRemovalAuthorizedAddressesPath = cadence.Path{
-	Domain:     common.PathDomainStorage.Identifier(),
+	Domain:     common.PathDomainStorage,
 	Identifier: "authorizedAddressesToRemoveContracts",
 }
 var IsContractDeploymentRestrictedPath = cadence.Path{
-	Domain:     common.PathDomainStorage.Identifier(),
+	Domain:     common.PathDomainStorage,
 	Identifier: "isContractDeploymentRestricted",
 }
 
@@ -32,7 +30,7 @@ var setContractOperationAuthorizersTransactionTemplate string
 var setIsContractDeploymentRestrictedTransactionTemplate string
 
 //go:embed scripts/deployContractTransactionTemplate.cdc
-var deployContractTransactionTemplate string
+var DeployContractTransactionTemplate []byte
 
 // SetContractDeploymentAuthorizersTransaction returns a transaction for updating list of authorized accounts allowed to deploy/update contracts
 func SetContractDeploymentAuthorizersTransaction(serviceAccount flow.Address, authorized []flow.Address) (*flow.TransactionBody, error) {
@@ -95,8 +93,8 @@ func SetIsContractDeploymentRestrictedTransaction(serviceAccount flow.Address, r
 // TODO (ramtin) get rid of authorizers
 func DeployContractTransaction(address flow.Address, contract []byte, contractName string) *flow.TransactionBody {
 	return flow.NewTransactionBody().
-		SetScript([]byte(deployContractTransactionTemplate)).
+		SetScript(DeployContractTransactionTemplate).
 		AddArgument(jsoncdc.MustEncode(cadence.String(contractName))).
-		AddArgument(jsoncdc.MustEncode(cadence.String(hex.EncodeToString(contract)))).
+		AddArgument(jsoncdc.MustEncode(cadence.String(contract))).
 		AddAuthorizer(address)
 }

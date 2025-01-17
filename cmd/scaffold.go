@@ -1,11 +1,11 @@
 package cmd
 
 import (
+	"context"
 	"crypto/tls"
 	"crypto/x509"
 	"errors"
 	"fmt"
-	"math/rand"
 	"os"
 	"runtime"
 	"strings"
@@ -14,20 +14,26 @@ import (
 	gcemd "cloud.google.com/go/compute/metadata"
 	"github.com/dgraph-io/badger/v2"
 	"github.com/hashicorp/go-multierror"
+	dht "github.com/libp2p/go-libp2p-kad-dht"
+	"github.com/libp2p/go-libp2p/core/host"
+	"github.com/libp2p/go-libp2p/core/peer"
+	"github.com/libp2p/go-libp2p/core/routing"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
 	"golang.org/x/time/rate"
 	"google.golang.org/api/option"
 
+	"github.com/onflow/crypto"
+
 	"github.com/onflow/flow-go/admin"
 	"github.com/onflow/flow-go/admin/commands"
 	"github.com/onflow/flow-go/admin/commands/common"
 	storageCommands "github.com/onflow/flow-go/admin/commands/storage"
 	"github.com/onflow/flow-go/cmd/build"
+	"github.com/onflow/flow-go/config"
 	"github.com/onflow/flow-go/consensus/hotstuff/persister"
-	"github.com/onflow/flow-go/fvm"
-	"github.com/onflow/flow-go/fvm/environment"
+	"github.com/onflow/flow-go/fvm/initialize"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/model/flow/filter"
 	"github.com/onflow/flow-go/module"
@@ -44,22 +50,29 @@ import (
 	"github.com/onflow/flow-go/module/updatable_configs"
 	"github.com/onflow/flow-go/module/util"
 	"github.com/onflow/flow-go/network"
+	alspmgr "github.com/onflow/flow-go/network/alsp/manager"
 	netcache "github.com/onflow/flow-go/network/cache"
+	"github.com/onflow/flow-go/network/channels"
+	"github.com/onflow/flow-go/network/converter"
 	"github.com/onflow/flow-go/network/p2p"
+	p2pbuilder "github.com/onflow/flow-go/network/p2p/builder"
+	p2pbuilderconfig "github.com/onflow/flow-go/network/p2p/builder/config"
 	"github.com/onflow/flow-go/network/p2p/cache"
 	"github.com/onflow/flow-go/network/p2p/conduit"
+	"github.com/onflow/flow-go/network/p2p/connection"
+	p2pdht "github.com/onflow/flow-go/network/p2p/dht"
 	"github.com/onflow/flow-go/network/p2p/dns"
-	"github.com/onflow/flow-go/network/p2p/inspector/validation"
-	"github.com/onflow/flow-go/network/p2p/middleware"
-	"github.com/onflow/flow-go/network/p2p/p2pbuilder"
-	p2pconfig "github.com/onflow/flow-go/network/p2p/p2pbuilder/config"
+	"github.com/onflow/flow-go/network/p2p/keyutils"
 	"github.com/onflow/flow-go/network/p2p/ping"
 	"github.com/onflow/flow-go/network/p2p/subscription"
+	"github.com/onflow/flow-go/network/p2p/translator"
 	"github.com/onflow/flow-go/network/p2p/unicast/protocols"
 	"github.com/onflow/flow-go/network/p2p/unicast/ratelimit"
+	"github.com/onflow/flow-go/network/p2p/utils"
 	"github.com/onflow/flow-go/network/p2p/utils/ratelimiter"
 	"github.com/onflow/flow-go/network/slashing"
 	"github.com/onflow/flow-go/network/topology"
+	"github.com/onflow/flow-go/network/underlay"
 	"github.com/onflow/flow-go/state/protocol"
 	badgerState "github.com/onflow/flow-go/state/protocol/badger"
 	"github.com/onflow/flow-go/state/protocol/events"
@@ -94,12 +107,17 @@ type namedModuleFunc struct {
 	name string
 }
 
-type namedComponentFunc struct {
-	fn   ReadyDoneFactory
-	name string
+// NamedComponentFactory is wrapper for ReadyDoneFactory with additional fields:
+// Name - name of the component
+// ErrorHandler - error handler for the component
+// Dependencies - list of dependencies for the component that should be ready before
+// the component is started
+type NamedComponentFactory[Input any] struct {
+	ComponentFactory ReadyDoneFactory[Input]
+	Name             string
 
-	errorHandler component.OnError
-	dependencies *DependencyList
+	ErrorHandler component.OnError
+	Dependencies *DependencyList
 }
 
 // FlowNodeBuilder is the default builder struct used for all flow nodes
@@ -115,7 +133,7 @@ type FlowNodeBuilder struct {
 	*NodeConfig
 	flags                    *pflag.FlagSet
 	modules                  []namedModuleFunc
-	components               []namedComponentFunc
+	components               []NamedComponentFactory[*NodeConfig]
 	postShutdownFns          []func() error
 	preInitFns               []BuilderFunc
 	postInitFns              []BuilderFunc
@@ -124,11 +142,21 @@ type FlowNodeBuilder struct {
 	adminCommandBootstrapper *admin.CommandRunnerBootstrapper
 	adminCommands            map[string]func(config *NodeConfig) commands.AdminCommand
 	componentBuilder         component.ComponentManagerBuilder
+	BootstrapNodeAddresses   []string
+	BootstrapNodePublicKeys  []string
 }
 
 var _ NodeBuilder = (*FlowNodeBuilder)(nil)
 
 func (fnb *FlowNodeBuilder) BaseFlags() {
+	defaultFlowConfig, err := config.DefaultConfig()
+	if err != nil {
+		fnb.Logger.Fatal().Err(err).Msg("failed to initialize flow config")
+	}
+
+	// initialize pflag set for Flow node
+	config.InitializePFlagSet(fnb.flags, defaultFlowConfig)
+
 	defaultConfig := DefaultBaseConfig()
 
 	// bind configuration parameters
@@ -139,8 +167,6 @@ func (fnb *FlowNodeBuilder) BaseFlags() {
 	fnb.flags.StringVar(&fnb.BaseConfig.secretsdir, "secretsdir", defaultConfig.secretsdir, "directory to store private database (secrets)")
 	fnb.flags.StringVarP(&fnb.BaseConfig.level, "loglevel", "l", defaultConfig.level, "level for logging output")
 	fnb.flags.Uint32Var(&fnb.BaseConfig.debugLogLimit, "debug-log-limit", defaultConfig.debugLogLimit, "max number of debug/trace log events per second")
-	fnb.flags.DurationVar(&fnb.BaseConfig.PeerUpdateInterval, "peerupdate-interval", defaultConfig.PeerUpdateInterval, "how often to refresh the peer connections for the node")
-	fnb.flags.DurationVar(&fnb.BaseConfig.UnicastMessageTimeout, "unicast-timeout", defaultConfig.UnicastMessageTimeout, "how long a unicast transmission can take to complete")
 	fnb.flags.UintVarP(&fnb.BaseConfig.metricsPort, "metricport", "m", defaultConfig.metricsPort, "port for /metrics endpoint")
 	fnb.flags.BoolVar(&fnb.BaseConfig.profilerConfig.Enabled, "profiler-enabled", defaultConfig.profilerConfig.Enabled, "whether to enable the auto-profiler")
 	fnb.flags.BoolVar(&fnb.BaseConfig.profilerConfig.UploaderEnabled, "profile-uploader-enabled", defaultConfig.profilerConfig.UploaderEnabled,
@@ -166,66 +192,80 @@ func (fnb *FlowNodeBuilder) BaseFlags() {
 	fnb.flags.StringVar(&fnb.BaseConfig.AdminClientCAs, "admin-client-certs", defaultConfig.AdminClientCAs, "admin client certs (for mutual TLS)")
 	fnb.flags.UintVar(&fnb.BaseConfig.AdminMaxMsgSize, "admin-max-response-size", defaultConfig.AdminMaxMsgSize, "admin server max response size in bytes")
 
-	fnb.flags.Float64Var(&fnb.BaseConfig.LibP2PResourceManagerConfig.FileDescriptorsRatio, "libp2p-fd-ratio", defaultConfig.LibP2PResourceManagerConfig.FileDescriptorsRatio, "ratio of available file descriptors to be used by libp2p (in (0,1])")
-	fnb.flags.Float64Var(&fnb.BaseConfig.LibP2PResourceManagerConfig.MemoryLimitRatio, "libp2p-memory-limit", defaultConfig.LibP2PResourceManagerConfig.MemoryLimitRatio, "ratio of available memory to be used by libp2p (in (0,1])")
-	fnb.flags.IntVar(&fnb.BaseConfig.LibP2PResourceManagerConfig.PeerBaseLimitConnsInbound, "libp2p-inbound-conns-limit", defaultConfig.LibP2PResourceManagerConfig.PeerBaseLimitConnsInbound, "the maximum amount of allowed inbound connections per peer")
-	fnb.flags.IntVar(&fnb.BaseConfig.ConnectionManagerConfig.LowWatermark, "libp2p-connmgr-low", defaultConfig.ConnectionManagerConfig.LowWatermark, "low watermarking for libp2p connection manager")
-	fnb.flags.IntVar(&fnb.BaseConfig.ConnectionManagerConfig.HighWatermark, "libp2p-connmgr-high", defaultConfig.ConnectionManagerConfig.HighWatermark, "high watermarking for libp2p connection manager")
-	fnb.flags.DurationVar(&fnb.BaseConfig.ConnectionManagerConfig.GracePeriod, "libp2p-connmgr-grace", defaultConfig.ConnectionManagerConfig.GracePeriod, "grace period for libp2p connection manager")
-	fnb.flags.DurationVar(&fnb.BaseConfig.ConnectionManagerConfig.SilencePeriod, "libp2p-connmgr-silence", defaultConfig.ConnectionManagerConfig.SilencePeriod, "silence period for libp2p connection manager")
-
-	fnb.flags.DurationVar(&fnb.BaseConfig.DNSCacheTTL, "dns-cache-ttl", defaultConfig.DNSCacheTTL, "time-to-live for dns cache")
-	fnb.flags.StringSliceVar(&fnb.BaseConfig.PreferredUnicastProtocols, "preferred-unicast-protocols", nil, "preferred unicast protocols in ascending order of preference")
-	fnb.flags.Uint32Var(&fnb.BaseConfig.NetworkReceivedMessageCacheSize, "networking-receive-cache-size", p2p.DefaultReceiveCacheSize,
-		"incoming message cache size at networking layer")
-	fnb.flags.BoolVar(&fnb.BaseConfig.NetworkConnectionPruning, "networking-connection-pruning", defaultConfig.NetworkConnectionPruning, "enabling connection trimming")
-	fnb.flags.BoolVar(&fnb.BaseConfig.GossipSubConfig.PeerScoring, "peer-scoring-enabled", defaultConfig.GossipSubConfig.PeerScoring, "enabling peer scoring on pubsub network")
-	fnb.flags.DurationVar(&fnb.BaseConfig.GossipSubConfig.LocalMeshLogInterval, "gossipsub-local-mesh-logging-interval", defaultConfig.GossipSubConfig.LocalMeshLogInterval, "logging interval for local mesh in gossipsub")
-	fnb.flags.DurationVar(&fnb.BaseConfig.GossipSubConfig.ScoreTracerInterval, "gossipsub-score-tracer-interval", defaultConfig.GossipSubConfig.ScoreTracerInterval, "logging interval for peer score tracer in gossipsub, set to 0 to disable")
 	fnb.flags.UintVar(&fnb.BaseConfig.guaranteesCacheSize, "guarantees-cache-size", bstorage.DefaultCacheSize, "collection guarantees cache size")
 	fnb.flags.UintVar(&fnb.BaseConfig.receiptsCacheSize, "receipts-cache-size", bstorage.DefaultCacheSize, "receipts cache size")
 
+	fnb.flags.BoolVar(&fnb.BaseConfig.DhtSystemEnabled,
+		"dht-enabled",
+		defaultConfig.DhtSystemEnabled,
+		"[experimental] whether to enable dht system. This is an experimental feature. Use with caution.")
+	fnb.flags.BoolVar(&fnb.BaseConfig.BitswapReprovideEnabled,
+		"bitswap-reprovide-enabled",
+		defaultConfig.BitswapReprovideEnabled,
+		"[experimental] whether to enable bitswap reproviding. This is an experimental feature. Use with caution.")
+
 	// dynamic node startup flags
-	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupANPubkey, "dynamic-startup-access-publickey", "", "the public key of the trusted secure access node to connect to when using dynamic-startup, this access node must be staked")
-	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupANAddress, "dynamic-startup-access-address", "", "the access address of the trusted secure access node to connect to when using dynamic-startup, this access node must be staked")
-	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupEpochPhase, "dynamic-startup-epoch-phase", "EpochPhaseSetup", "the target epoch phase for dynamic startup <EpochPhaseStaking|EpochPhaseSetup|EpochPhaseCommitted")
-	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupEpoch, "dynamic-startup-epoch", "current", "the target epoch for dynamic-startup, use \"current\" to start node in the current epoch")
-	fnb.flags.DurationVar(&fnb.BaseConfig.DynamicStartupSleepInterval, "dynamic-startup-sleep-interval", time.Minute, "the interval in which the node will check if it can start")
+	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupANPubkey,
+		"dynamic-startup-access-publickey",
+		"",
+		"the public key of the trusted secure access node to connect to when using dynamic-startup, this access node must be staked")
+	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupANAddress,
+		"dynamic-startup-access-address",
+		"",
+		"the access address of the trusted secure access node to connect to when using dynamic-startup, this access node must be staked")
+	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupEpochPhase,
+		"dynamic-startup-epoch-phase",
+		"EpochPhaseSetup",
+		"the target epoch phase for dynamic startup <EpochPhaseStaking|EpochPhaseSetup|EpochPhaseCommitted")
+	fnb.flags.StringVar(&fnb.BaseConfig.DynamicStartupEpoch,
+		"dynamic-startup-epoch",
+		"current",
+		"the target epoch for dynamic-startup, use \"current\" to start node in the current epoch")
+	fnb.flags.DurationVar(&fnb.BaseConfig.DynamicStartupSleepInterval,
+		"dynamic-startup-sleep-interval",
+		time.Minute,
+		"the interval in which the node will check if it can start")
 
 	fnb.flags.BoolVar(&fnb.BaseConfig.InsecureSecretsDB, "insecure-secrets-db", false, "allow the node to start up without an secrets DB encryption key")
 	fnb.flags.BoolVar(&fnb.BaseConfig.HeroCacheMetricsEnable, "herocache-metrics-collector", false, "enables herocache metrics collection")
 
 	// sync core flags
-	fnb.flags.DurationVar(&fnb.BaseConfig.SyncCoreConfig.RetryInterval, "sync-retry-interval", defaultConfig.SyncCoreConfig.RetryInterval, "the initial interval before we retry a sync request, uses exponential backoff")
-	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.Tolerance, "sync-tolerance", defaultConfig.SyncCoreConfig.Tolerance, "determines how big of a difference in block heights we tolerate before actively syncing with range requests")
-	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.MaxAttempts, "sync-max-attempts", defaultConfig.SyncCoreConfig.MaxAttempts, "the maximum number of attempts we make for each requested block/height before discarding")
-	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.MaxSize, "sync-max-size", defaultConfig.SyncCoreConfig.MaxSize, "the maximum number of blocks we request in the same block request message")
-	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.MaxRequests, "sync-max-requests", defaultConfig.SyncCoreConfig.MaxRequests, "the maximum number of requests we send during each scanning period")
+	fnb.flags.DurationVar(&fnb.BaseConfig.SyncCoreConfig.RetryInterval,
+		"sync-retry-interval",
+		defaultConfig.SyncCoreConfig.RetryInterval,
+		"the initial interval before we retry a sync request, uses exponential backoff")
+	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.Tolerance,
+		"sync-tolerance",
+		defaultConfig.SyncCoreConfig.Tolerance,
+		"determines how big of a difference in block heights we tolerate before actively syncing with range requests")
+	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.MaxAttempts,
+		"sync-max-attempts",
+		defaultConfig.SyncCoreConfig.MaxAttempts,
+		"the maximum number of attempts we make for each requested block/height before discarding")
+	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.MaxSize,
+		"sync-max-size",
+		defaultConfig.SyncCoreConfig.MaxSize,
+		"the maximum number of blocks we request in the same block request message")
+	fnb.flags.UintVar(&fnb.BaseConfig.SyncCoreConfig.MaxRequests,
+		"sync-max-requests",
+		defaultConfig.SyncCoreConfig.MaxRequests,
+		"the maximum number of requests we send during each scanning period")
 
-	fnb.flags.Uint64Var(&fnb.BaseConfig.ComplianceConfig.SkipNewProposalsThreshold, "compliance-skip-proposals-threshold", defaultConfig.ComplianceConfig.SkipNewProposalsThreshold, "threshold at which new proposals are discarded rather than cached, if their height is this much above local finalized height")
+	fnb.flags.Uint64Var(&fnb.BaseConfig.ComplianceConfig.SkipNewProposalsThreshold,
+		"compliance-skip-proposals-threshold",
+		defaultConfig.ComplianceConfig.SkipNewProposalsThreshold,
+		"threshold at which new proposals are discarded rather than cached, if their height is this much above local finalized height")
 
-	// unicast stream handler rate limits
-	fnb.flags.IntVar(&fnb.BaseConfig.UnicastRateLimitersConfig.MessageRateLimit, "unicast-message-rate-limit", defaultConfig.UnicastRateLimitersConfig.MessageRateLimit, "maximum number of unicast messages that a peer can send per second")
-	fnb.flags.IntVar(&fnb.BaseConfig.UnicastRateLimitersConfig.BandwidthRateLimit, "unicast-bandwidth-rate-limit", defaultConfig.UnicastRateLimitersConfig.BandwidthRateLimit, "bandwidth size in bytes a peer is allowed to send via unicast streams per second")
-	fnb.flags.IntVar(&fnb.BaseConfig.UnicastRateLimitersConfig.BandwidthBurstLimit, "unicast-bandwidth-burst-limit", defaultConfig.UnicastRateLimitersConfig.BandwidthBurstLimit, "bandwidth size in bytes a peer is allowed to send at one time")
-	fnb.flags.DurationVar(&fnb.BaseConfig.UnicastRateLimitersConfig.LockoutDuration, "unicast-rate-limit-lockout-duration", defaultConfig.UnicastRateLimitersConfig.LockoutDuration, "the number of seconds a peer will be forced to wait before being allowed to successful reconnect to the node after being rate limited")
-	fnb.flags.BoolVar(&fnb.BaseConfig.UnicastRateLimitersConfig.DryRun, "unicast-rate-limit-dry-run", defaultConfig.UnicastRateLimitersConfig.DryRun, "disable peer disconnects and connections gating when rate limiting peers")
-
-	// gossipsub RPC control message validation limits used for validation configuration and rate limiting
-	fnb.flags.IntVar(&fnb.BaseConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.NumberOfWorkers, "gossipsub-rpc-validation-inspector-workers", defaultConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.NumberOfWorkers, "number of gossupsub RPC control message validation inspector component workers")
-	fnb.flags.Uint32Var(&fnb.BaseConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.CacheSize, "gossipsub-rpc-validation-inspector-cache-size", defaultConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.CacheSize, "cache size for gossipsub RPC validation inspector events worker pool queue.")
-	fnb.flags.StringToIntVar(&fnb.BaseConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.GraftLimits, "gossipsub-rpc-graft-limits", defaultConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.GraftLimits, fmt.Sprintf("discard threshold, safety and rate limits for gossipsub RPC GRAFT message validation e.g: %s=1000,%s=100,%s=1000", validation.DiscardThresholdMapKey, validation.SafetyThresholdMapKey, validation.RateLimitMapKey))
-	fnb.flags.StringToIntVar(&fnb.BaseConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.PruneLimits, "gossipsub-rpc-prune-limits", defaultConfig.GossipSubConfig.RpcInspector.ValidationInspectorConfigs.PruneLimits, fmt.Sprintf("discard threshold, safety and rate limits for gossipsub RPC PRUNE message validation e.g: %s=1000,%s=20,%s=1000", validation.DiscardThresholdMapKey, validation.SafetyThresholdMapKey, validation.RateLimitMapKey))
-	// gossipsub RPC control message metrics observer inspector configuration
-	fnb.flags.IntVar(&fnb.BaseConfig.GossipSubConfig.RpcInspector.MetricsInspectorConfigs.NumberOfWorkers, "gossipsub-rpc-metrics-inspector-workers", defaultConfig.GossipSubConfig.RpcInspector.MetricsInspectorConfigs.NumberOfWorkers, "cache size for gossipsub RPC metrics inspector events worker pool queue.")
-	fnb.flags.Uint32Var(&fnb.BaseConfig.GossipSubConfig.RpcInspector.MetricsInspectorConfigs.CacheSize, "gossipsub-rpc-metrics-inspector-cache-size", defaultConfig.GossipSubConfig.RpcInspector.MetricsInspectorConfigs.CacheSize, "cache size for gossipsub RPC metrics inspector events worker pool.")
-
-	// networking event notifications
-	fnb.flags.Uint32Var(&fnb.BaseConfig.GossipSubConfig.RpcInspector.GossipSubRPCInspectorNotificationCacheSize, "gossipsub-rpc-inspector-notification-cache-size", defaultConfig.GossipSubConfig.RpcInspector.GossipSubRPCInspectorNotificationCacheSize, "cache size for notification events from gossipsub rpc inspector")
-	fnb.flags.Uint32Var(&fnb.BaseConfig.DisallowListNotificationCacheSize, "disallow-list-notification-cache-size", defaultConfig.DisallowListNotificationCacheSize, "cache size for notification events from disallow list")
-
-	// unicast manager options
-	fnb.flags.DurationVar(&fnb.BaseConfig.UnicastCreateStreamRetryDelay, "unicast-manager-create-stream-retry-delay", defaultConfig.NetworkConfig.UnicastCreateStreamRetryDelay, "Initial delay between failing to establish a connection with another node and retrying. This delay increases exponentially (exponential backoff) with the number of subsequent failures to establish a connection.")
+	// observer mode allows a unstaked execution node to fetch blocks from a public staked access node, and being able to execute blocks
+	fnb.flags.BoolVar(&fnb.BaseConfig.ObserverMode, "observer-mode", defaultConfig.ObserverMode, "whether the node is running in observer mode")
+	fnb.flags.StringSliceVar(&fnb.BootstrapNodePublicKeys,
+		"observer-mode-bootstrap-node-public-keys",
+		[]string{},
+		"the networking public key of the bootstrap access node if this is an observer (in the same order as the bootstrap node addresses) e.g. \"d57a5e9c5.....\",\"44ded42d....\"")
+	fnb.flags.StringSliceVar(&fnb.BootstrapNodeAddresses,
+		"observer-mode-bootstrap-node-addresses",
+		[]string{},
+		"the network addresses of the bootstrap access node if this is an observer e.g. access-001.mainnet.flow.org:9653,access-002.mainnet.flow.org:9653")
 }
 
 func (fnb *FlowNodeBuilder) EnqueuePingService() {
@@ -235,7 +275,7 @@ func (fnb *FlowNodeBuilder) EnqueuePingService() {
 		// setup the Ping provider to return the software version and the sealed block height
 		pingInfoProvider := &ping.InfoProvider{
 			SoftwareVersionFun: func() string {
-				return build.Semver()
+				return build.Version()
 			},
 			SealedBlockHeightFun: func() (uint64, error) {
 				head, err := node.State.Sealed().Head()
@@ -264,7 +304,7 @@ func (fnb *FlowNodeBuilder) EnqueuePingService() {
 			}
 		}
 
-		pingService, err := node.Network.RegisterPingService(pingLibP2PProtocolID, pingInfoProvider)
+		pingService, err := node.EngineRegistry.RegisterPingService(pingLibP2PProtocolID, pingInfoProvider)
 
 		node.PingService = pingService
 
@@ -292,7 +332,7 @@ func (fnb *FlowNodeBuilder) EnqueueResolver() {
 			node.Logger,
 			fnb.Metrics.Network,
 			cache,
-			dns.WithTTL(fnb.BaseConfig.DNSCacheTTL))
+			dns.WithTTL(fnb.BaseConfig.FlowConfig.NetworkConfig.DNSCacheTTL))
 
 		fnb.Resolver = resolver
 		return resolver, nil
@@ -309,21 +349,21 @@ func (fnb *FlowNodeBuilder) EnqueueNetworkInit() {
 
 	// setup default rate limiter options
 	unicastRateLimiterOpts := []ratelimit.RateLimitersOption{
-		ratelimit.WithDisabledRateLimiting(fnb.BaseConfig.UnicastRateLimitersConfig.DryRun),
+		ratelimit.WithDisabledRateLimiting(fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.DryRun),
 		ratelimit.WithNotifier(fnb.UnicastRateLimiterDistributor),
 	}
 
 	// override noop unicast message rate limiter
-	if fnb.BaseConfig.UnicastRateLimitersConfig.MessageRateLimit > 0 {
+	if fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.MessageRateLimit > 0 {
 		unicastMessageRateLimiter := ratelimiter.NewRateLimiter(
-			rate.Limit(fnb.BaseConfig.UnicastRateLimitersConfig.MessageRateLimit),
-			fnb.BaseConfig.UnicastRateLimitersConfig.MessageRateLimit,
-			fnb.BaseConfig.UnicastRateLimitersConfig.LockoutDuration,
+			rate.Limit(fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.MessageRateLimit),
+			fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.MessageRateLimit,
+			fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.LockoutDuration,
 		)
 		unicastRateLimiterOpts = append(unicastRateLimiterOpts, ratelimit.WithMessageRateLimiter(unicastMessageRateLimiter))
 
 		// avoid connection gating and pruning during dry run
-		if !fnb.BaseConfig.UnicastRateLimitersConfig.DryRun {
+		if !fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.DryRun {
 			f := rateLimiterPeerFilter(unicastMessageRateLimiter)
 			// add IsRateLimited peerFilters to conn gater intercept secure peer and peer manager filters list
 			// don't allow rate limited peers to establishing incoming connections
@@ -334,16 +374,16 @@ func (fnb *FlowNodeBuilder) EnqueueNetworkInit() {
 	}
 
 	// override noop unicast bandwidth rate limiter
-	if fnb.BaseConfig.UnicastRateLimitersConfig.BandwidthRateLimit > 0 && fnb.BaseConfig.UnicastRateLimitersConfig.BandwidthBurstLimit > 0 {
+	if fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.BandwidthRateLimit > 0 && fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.BandwidthBurstLimit > 0 {
 		unicastBandwidthRateLimiter := ratelimit.NewBandWidthRateLimiter(
-			rate.Limit(fnb.BaseConfig.UnicastRateLimitersConfig.BandwidthRateLimit),
-			fnb.BaseConfig.UnicastRateLimitersConfig.BandwidthBurstLimit,
-			fnb.BaseConfig.UnicastRateLimitersConfig.LockoutDuration,
+			rate.Limit(fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.BandwidthRateLimit),
+			fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.BandwidthBurstLimit,
+			fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.LockoutDuration,
 		)
 		unicastRateLimiterOpts = append(unicastRateLimiterOpts, ratelimit.WithBandwidthRateLimiter(unicastBandwidthRateLimiter))
 
 		// avoid connection gating and pruning during dry run
-		if !fnb.BaseConfig.UnicastRateLimitersConfig.DryRun {
+		if !fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast.RateLimiter.DryRun {
 			f := rateLimiterPeerFilter(unicastBandwidthRateLimiter)
 			// add IsRateLimited peerFilters to conn gater intercept secure peer and peer manager filters list
 			connGaterInterceptSecureFilters = append(connGaterInterceptSecureFilters, f)
@@ -354,19 +394,20 @@ func (fnb *FlowNodeBuilder) EnqueueNetworkInit() {
 	// setup unicast rate limiters
 	unicastRateLimiters := ratelimit.NewRateLimiters(unicastRateLimiterOpts...)
 
-	uniCfg := &p2pconfig.UnicastConfig{
-		StreamRetryInterval:    fnb.UnicastCreateStreamRetryDelay,
+	uniCfg := &p2pbuilderconfig.UnicastConfig{
+		Unicast:                fnb.BaseConfig.FlowConfig.NetworkConfig.Unicast,
 		RateLimiterDistributor: fnb.UnicastRateLimiterDistributor,
 	}
 
-	connGaterCfg := &p2pconfig.ConnectionGaterConfig{
+	connGaterCfg := &p2pbuilderconfig.ConnectionGaterConfig{
 		InterceptPeerDialFilters: connGaterPeerDialFilters,
 		InterceptSecuredFilters:  connGaterInterceptSecureFilters,
 	}
 
-	peerManagerCfg := &p2pconfig.PeerManagerConfig{
-		ConnectionPruning: fnb.NetworkConnectionPruning,
-		UpdateInterval:    fnb.PeerUpdateInterval,
+	peerManagerCfg := &p2pbuilderconfig.PeerManagerConfig{
+		ConnectionPruning: fnb.FlowConfig.NetworkConfig.NetworkConnectionPruning,
+		UpdateInterval:    fnb.FlowConfig.NetworkConfig.PeerUpdateInterval,
+		ConnectorFactory:  connection.DefaultLibp2pBackoffConnectorFactory(),
 	}
 
 	fnb.Component(LibP2PNodeComponent, func(node *NodeConfig) (module.ReadyDoneAware, error) {
@@ -375,13 +416,33 @@ func (fnb *FlowNodeBuilder) EnqueueNetworkInit() {
 			myAddr = fnb.BaseConfig.BindAddr
 		}
 
-		libP2PNodeFactory := p2pbuilder.DefaultLibP2PNodeFactory(
-			fnb.Logger,
+		if fnb.ObserverMode {
+			// observer mode only init public libp2p node
+			ids, err := fnb.DeriveBootstrapPeerIdentities()
+			if err != nil {
+				return nil, fmt.Errorf("failed to derive bootstrap peer identities: %w", err)
+			}
+
+			publicLibp2pNode, err := fnb.BuildPublicLibp2pNode(myAddr, ids)
+			if err != nil {
+				return nil, fmt.Errorf("could not build public libp2p node: %w", err)
+			}
+			fnb.LibP2PNode = publicLibp2pNode
+
+			return publicLibp2pNode, nil
+		}
+
+		dhtActivationStatus, err := DhtSystemActivationStatus(fnb.NodeRole, fnb.DhtSystemEnabled)
+		if err != nil {
+			return nil, fmt.Errorf("could not determine dht activation status: %w", err)
+		}
+		builder, err := p2pbuilder.DefaultNodeBuilder(fnb.Logger,
 			myAddr,
+			network.PrivateNetwork,
 			fnb.NetworkKey,
 			fnb.SporkID,
 			fnb.IdentityProvider,
-			&p2pconfig.MetricsConfig{
+			&p2pbuilderconfig.MetricsConfig{
 				Metrics:          fnb.Metrics.Network,
 				HeroCacheFactory: fnb.HeroCacheMetricsFactory(),
 			},
@@ -389,36 +450,53 @@ func (fnb *FlowNodeBuilder) EnqueueNetworkInit() {
 			fnb.BaseConfig.NodeRole,
 			connGaterCfg,
 			peerManagerCfg,
-			// run peer manager with the specified interval and let it also prune connections
-			fnb.GossipSubConfig,
-			fnb.LibP2PResourceManagerConfig,
+			&fnb.FlowConfig.NetworkConfig.GossipSub,
+			&fnb.FlowConfig.NetworkConfig.ResourceManager,
 			uniCfg,
-		)
-
-		libp2pNode, err := libP2PNodeFactory()
+			&fnb.FlowConfig.NetworkConfig.ConnectionManager,
+			&p2p.DisallowListCacheConfig{
+				MaxSize: fnb.FlowConfig.NetworkConfig.DisallowListNotificationCacheSize,
+				Metrics: metrics.DisallowListCacheMetricsFactory(fnb.HeroCacheMetricsFactory(), network.PrivateNetwork),
+			},
+			dhtActivationStatus)
 		if err != nil {
-			return nil, fmt.Errorf("failed to create libp2p node: %w", err)
+			return nil, fmt.Errorf("could not create libp2p node builder: %w", err)
 		}
-		fnb.LibP2PNode = libp2pNode
 
+		libp2pNode, err := builder.Build()
+		if err != nil {
+			return nil, fmt.Errorf("could not build libp2p node: %w", err)
+		}
+
+		fnb.LibP2PNode = libp2pNode
 		return libp2pNode, nil
 	})
 	fnb.Component(NetworkComponent, func(node *NodeConfig) (module.ReadyDoneAware, error) {
-		cf := conduit.NewDefaultConduitFactory(fnb.Logger, fnb.Metrics.Network)
 		fnb.Logger.Info().Hex("node_id", logging.ID(fnb.NodeID)).Msg("default conduit factory initiated")
-		return fnb.InitFlowNetworkWithConduitFactory(node, cf, unicastRateLimiters, peerManagerFilters)
+		return fnb.InitFlowNetworkWithConduitFactory(
+			node,
+			conduit.NewDefaultConduitFactory(),
+			unicastRateLimiters,
+			peerManagerFilters)
 	})
 
-	fnb.Module("middleware dependency", func(node *NodeConfig) error {
-		fnb.middlewareDependable = module.NewProxiedReadyDoneAware()
-		fnb.PeerManagerDependencies.Add(fnb.middlewareDependable)
+	fnb.Module("epoch transition logger", func(node *NodeConfig) error {
+		node.ProtocolEvents.AddConsumer(events.NewEventLogger(node.Logger))
+		return nil
+	})
+
+	fnb.Module("network underlay dependency", func(node *NodeConfig) error {
+		fnb.networkUnderlayDependable = module.NewProxiedReadyDoneAware()
+		fnb.PeerManagerDependencies.Add(fnb.networkUnderlayDependable)
 		return nil
 	})
 
 	// peer manager won't be created until all PeerManagerDependencies are ready.
-	fnb.DependableComponent("peer manager", func(node *NodeConfig) (module.ReadyDoneAware, error) {
-		return fnb.LibP2PNode.PeerManagerComponent(), nil
-	}, fnb.PeerManagerDependencies)
+	if !fnb.ObserverMode {
+		fnb.DependableComponent("peer manager", func(node *NodeConfig) (module.ReadyDoneAware, error) {
+			return fnb.LibP2PNode.PeerManagerComponent(), nil
+		}, fnb.PeerManagerDependencies)
+	}
 }
 
 // HeroCacheMetricsFactory returns a HeroCacheMetricsFactory based on the MetricsEnabled flag.
@@ -431,76 +509,171 @@ func (fnb *FlowNodeBuilder) HeroCacheMetricsFactory() metrics.HeroCacheMetricsFa
 	return metrics.NewNoopHeroCacheMetricsFactory()
 }
 
-func (fnb *FlowNodeBuilder) InitFlowNetworkWithConduitFactory(node *NodeConfig, cf network.ConduitFactory, unicastRateLimiters *ratelimit.RateLimiters, peerManagerFilters []p2p.PeerFilter) (network.Network, error) {
-	var mwOpts []middleware.MiddlewareOption
+// DeriveBootstrapPeerIdentities derives the Flow Identity of the bootstrap peers from the parameters.
+// These are the identities of the observers also acting as the DHT bootstrap server
+func (fnb *FlowNodeBuilder) DeriveBootstrapPeerIdentities() (flow.IdentitySkeletonList, error) {
+	ids, err := BootstrapIdentities(fnb.BootstrapNodeAddresses, fnb.BootstrapNodePublicKeys)
+	if err != nil {
+		return nil, fmt.Errorf("failed to derive bootstrap peer identities: %w", err)
+	}
+
+	return ids, nil
+}
+
+// BuildPublicLibp2pNode creates a libp2p node for the observer service in the public (unstaked) network.
+// The factory function is later passed into the initMiddleware function to eventually instantiate the p2p.LibP2PNode instance
+// The LibP2P host is created with the following options:
+// * DHT as client and seeded with the given bootstrap peers
+// * The specified bind address as the listen address
+// * The passed in private key as the libp2p key
+// * No connection gater
+// * No connection manager
+// * No peer manager
+// * Default libp2p pubsub options.
+// Args:
+// - networkKey: the private key to use for the libp2p node
+// Returns:
+// - p2p.LibP2PNode: the libp2p node
+// - error: if any error occurs. Any error returned is considered irrecoverable.
+func (fnb *FlowNodeBuilder) BuildPublicLibp2pNode(address string, bootstrapIdentities flow.IdentitySkeletonList) (p2p.LibP2PNode, error) {
+	var pis []peer.AddrInfo
+
+	for _, b := range bootstrapIdentities {
+		pi, err := utils.PeerAddressInfo(*b)
+		if err != nil {
+			return nil, fmt.Errorf("could not extract peer address info from bootstrap identity %v: %w", b, err)
+		}
+
+		pis = append(pis, pi)
+	}
+
+	node, err := p2pbuilder.NewNodeBuilder(
+		fnb.Logger,
+		&fnb.FlowConfig.NetworkConfig.GossipSub,
+		&p2pbuilderconfig.MetricsConfig{
+			HeroCacheFactory: fnb.HeroCacheMetricsFactory(),
+			Metrics:          fnb.Metrics.Network,
+		},
+		network.PublicNetwork,
+		address,
+		fnb.NetworkKey,
+		fnb.SporkID,
+		fnb.IdentityProvider,
+		&fnb.FlowConfig.NetworkConfig.ResourceManager,
+		p2pbuilderconfig.PeerManagerDisableConfig(), // disable peer manager for observer node.
+		&p2p.DisallowListCacheConfig{
+			MaxSize: fnb.FlowConfig.NetworkConfig.DisallowListNotificationCacheSize,
+			Metrics: metrics.DisallowListCacheMetricsFactory(fnb.HeroCacheMetricsFactory(), network.PublicNetwork),
+		},
+		&p2pbuilderconfig.UnicastConfig{
+			Unicast: fnb.FlowConfig.NetworkConfig.Unicast,
+		}).
+		SetSubscriptionFilter(
+			subscription.NewRoleBasedFilter(
+				subscription.UnstakedRole, fnb.IdentityProvider,
+			),
+		).
+		SetRoutingSystem(func(ctx context.Context, h host.Host) (routing.Routing, error) {
+			return p2pdht.NewDHT(ctx, h, protocols.FlowPublicDHTProtocolID(fnb.SporkID),
+				fnb.Logger,
+				fnb.Metrics.Network,
+				p2pdht.AsClient(),
+				dht.BootstrapPeers(pis...),
+			)
+		}).
+		Build()
+
+	if err != nil {
+		return nil, fmt.Errorf("could not initialize libp2p node for observer: %w", err)
+	}
+	return node, nil
+}
+
+func (fnb *FlowNodeBuilder) InitFlowNetworkWithConduitFactory(
+	node *NodeConfig,
+	cf network.ConduitFactory,
+	unicastRateLimiters *ratelimit.RateLimiters,
+	peerManagerFilters []p2p.PeerFilter) (network.EngineRegistry, error) {
+
+	var networkOptions []underlay.NetworkOption
 	if len(fnb.MsgValidators) > 0 {
-		mwOpts = append(mwOpts, middleware.WithMessageValidators(fnb.MsgValidators...))
+		networkOptions = append(networkOptions, underlay.WithMessageValidators(fnb.MsgValidators...))
 	}
 
 	// by default if no rate limiter configuration was provided in the CLI args the default
 	// noop rate limiter will be used.
-	mwOpts = append(mwOpts, middleware.WithUnicastRateLimiters(unicastRateLimiters))
+	networkOptions = append(networkOptions, underlay.WithUnicastRateLimiters(unicastRateLimiters))
 
-	mwOpts = append(mwOpts,
-		middleware.WithPreferredUnicastProtocols(protocols.ToProtocolNames(fnb.PreferredUnicastProtocols)),
+	networkOptions = append(networkOptions,
+		underlay.WithPreferredUnicastProtocols(protocols.ToProtocolNames(fnb.FlowConfig.NetworkConfig.PreferredUnicastProtocols)...),
 	)
 
-	// peerManagerFilters are used by the peerManager via the middleware to filter peers from the topology.
+	// peerManagerFilters are used by the peerManager via the network to filter peers from the topology.
 	if len(peerManagerFilters) > 0 {
-		mwOpts = append(mwOpts, middleware.WithPeerManagerFilters(peerManagerFilters))
+		networkOptions = append(networkOptions, underlay.WithPeerManagerFilters(peerManagerFilters...))
 	}
 
-	slashingViolationsConsumer := slashing.NewSlashingViolationsConsumer(fnb.Logger, fnb.Metrics.Network)
-	mw := middleware.NewMiddleware(
+	receiveCache := netcache.NewHeroReceiveCache(fnb.FlowConfig.NetworkConfig.NetworkReceivedMessageCacheSize,
 		fnb.Logger,
-		fnb.LibP2PNode,
-		fnb.Me.NodeID(),
-		fnb.Metrics.Bitswap,
-		fnb.SporkID,
-		fnb.BaseConfig.UnicastMessageTimeout,
-		fnb.IDTranslator,
-		fnb.CodecFactory(),
-		slashingViolationsConsumer,
-		mwOpts...)
-	fnb.NodeDisallowListDistributor.AddConsumer(mw)
-	fnb.Middleware = mw
-
-	subscriptionManager := subscription.NewChannelSubscriptionManager(fnb.Middleware)
-
-	receiveCache := netcache.NewHeroReceiveCache(fnb.NetworkReceivedMessageCacheSize,
-		fnb.Logger,
-		metrics.NetworkReceiveCacheMetricsFactory(fnb.HeroCacheMetricsFactory(), p2p.PrivateNetwork))
+		metrics.NetworkReceiveCacheMetricsFactory(fnb.HeroCacheMetricsFactory(), network.PrivateNetwork))
 
 	err := node.Metrics.Mempool.Register(metrics.ResourceNetworkingReceiveCache, receiveCache.Size)
 	if err != nil {
 		return nil, fmt.Errorf("could not register networking receive cache metric: %w", err)
 	}
 
+	networkType := network.PrivateNetwork
+	if fnb.ObserverMode {
+		// observer mode uses public network
+		networkType = network.PublicNetwork
+	}
+
 	// creates network instance
-	net, err := p2p.NewNetwork(&p2p.NetworkParameters{
-		Logger:              fnb.Logger,
-		Codec:               fnb.CodecFactory(),
-		Me:                  fnb.Me,
-		MiddlewareFactory:   func() (network.Middleware, error) { return fnb.Middleware, nil },
-		Topology:            topology.NewFullyConnectedTopology(),
-		SubscriptionManager: subscriptionManager,
-		Metrics:             fnb.Metrics.Network,
-		IdentityProvider:    fnb.IdentityProvider,
-		ReceiveCache:        receiveCache,
-		Options:             []p2p.NetworkOptFunction{p2p.WithConduitFactory(cf)},
-	})
+	net, err := underlay.NewNetwork(&underlay.NetworkConfig{
+		Logger:                fnb.Logger,
+		Libp2pNode:            fnb.LibP2PNode,
+		Codec:                 fnb.CodecFactory(),
+		Me:                    fnb.Me,
+		SporkId:               fnb.SporkID,
+		Topology:              topology.NewFullyConnectedTopology(),
+		Metrics:               fnb.Metrics.Network,
+		BitSwapMetrics:        fnb.Metrics.Bitswap,
+		IdentityProvider:      fnb.IdentityProvider,
+		ReceiveCache:          receiveCache,
+		ConduitFactory:        cf,
+		UnicastMessageTimeout: fnb.FlowConfig.NetworkConfig.Unicast.MessageTimeout,
+		IdentityTranslator:    fnb.IDTranslator,
+		AlspCfg: &alspmgr.MisbehaviorReportManagerConfig{
+			Logger:                  fnb.Logger,
+			SpamRecordCacheSize:     fnb.FlowConfig.NetworkConfig.AlspConfig.SpamRecordCacheSize,
+			SpamReportQueueSize:     fnb.FlowConfig.NetworkConfig.AlspConfig.SpamReportQueueSize,
+			DisablePenalty:          fnb.FlowConfig.NetworkConfig.AlspConfig.DisablePenalty,
+			HeartBeatInterval:       fnb.FlowConfig.NetworkConfig.AlspConfig.HearBeatInterval,
+			AlspMetrics:             fnb.Metrics.Network,
+			HeroCacheMetricsFactory: fnb.HeroCacheMetricsFactory(),
+			NetworkType:             networkType,
+		},
+		SlashingViolationConsumerFactory: func(adapter network.ConduitAdapter) network.ViolationsConsumer {
+			return slashing.NewSlashingViolationsConsumer(fnb.Logger, fnb.Metrics.Network, adapter)
+		},
+	}, networkOptions...)
 	if err != nil {
 		return nil, fmt.Errorf("could not initialize network: %w", err)
 	}
 
-	fnb.Network = net
+	if node.ObserverMode {
+		fnb.EngineRegistry = converter.NewNetwork(net, channels.SyncCommittee, channels.PublicSyncCommittee)
+	} else {
+		fnb.EngineRegistry = net // setting network as the fnb.Network for the engine-level components
+	}
+	fnb.NetworkUnderlay = net // setting network as the fnb.Underlay for the lower-level components
 
-	// register middleware's ReadyDoneAware interface so other components can depend on it for startup
-	if fnb.middlewareDependable != nil {
-		fnb.middlewareDependable.Init(fnb.Middleware)
+	// register network ReadyDoneAware interface so other components can depend on it for startup
+	if fnb.networkUnderlayDependable != nil {
+		fnb.networkUnderlayDependable.Init(fnb.NetworkUnderlay)
 	}
 
-	idEvents := gadgets.NewIdentityDeltas(fnb.Middleware.UpdateNodeAddresses)
+	idEvents := gadgets.NewIdentityDeltas(net.UpdateNodeAddresses)
 	fnb.ProtocolEvents.AddConsumer(idEvents)
 
 	return net, nil
@@ -580,15 +753,28 @@ func (fnb *FlowNodeBuilder) ParseAndPrintFlags() error {
 	// parse configuration parameters
 	pflag.Parse()
 
-	// print all flags
-	log := fnb.Logger.Info()
+	configOverride, err := config.BindPFlags(&fnb.BaseConfig.FlowConfig, fnb.flags)
+	if err != nil {
+		return err
+	}
 
-	pflag.VisitAll(func(flag *pflag.Flag) {
-		log = log.Str(flag.Name, flag.Value.String())
+	if configOverride {
+		fnb.Logger.Info().Str("config-file", fnb.FlowConfig.ConfigFile).Msg("configuration file updated")
+	}
+
+	if err = fnb.BaseConfig.FlowConfig.Validate(); err != nil {
+		fnb.Logger.Fatal().Err(err).Msg("flow configuration validation failed")
+	}
+
+	info := fnb.Logger.Error()
+
+	noPrint := config.LogConfig(info, fnb.flags)
+	fnb.flags.VisitAll(func(flag *pflag.Flag) {
+		if _, ok := noPrint[flag.Name]; !ok {
+			info.Str(flag.Name, fmt.Sprintf("%v", flag.Value))
+		}
 	})
-
-	log.Msg("flags loaded")
-
+	info.Msg("configuration loaded (logged as error for visibility)")
 	return fnb.extraFlagsValidation()
 }
 
@@ -603,7 +789,7 @@ func (fnb *FlowNodeBuilder) ValidateFlags(f func() error) NodeBuilder {
 }
 
 func (fnb *FlowNodeBuilder) PrintBuildVersionDetails() {
-	fnb.Logger.Info().Str("version", build.Semver()).Str("commit", build.Commit()).Msg("build details")
+	fnb.Logger.Info().Str("version", build.Version()).Str("commit", build.Commit()).Msg("build details")
 }
 
 func (fnb *FlowNodeBuilder) initNodeInfo() error {
@@ -621,11 +807,46 @@ func (fnb *FlowNodeBuilder) initNodeInfo() error {
 		return fmt.Errorf("failed to load private node info: %w", err)
 	}
 
-	fnb.NodeID = nodeID
-	fnb.NetworkKey = info.NetworkPrivKey.PrivateKey
 	fnb.StakingKey = info.StakingPrivKey.PrivateKey
 
+	if fnb.ObserverMode {
+		// observer mode uses a network private key with different format than the staked node,
+		// so it has to load the network private key from a separate file
+		networkingPrivateKey, err := LoadNetworkPrivateKey(fnb.BaseConfig.BootstrapDir, nodeID)
+		if err != nil {
+			return fmt.Errorf("failed to load networking private key: %w", err)
+		}
+
+		peerID, err := peerIDFromNetworkKey(networkingPrivateKey)
+		if err != nil {
+			return fmt.Errorf("could not get peer ID from network key: %w", err)
+		}
+
+		// public node ID for observer is derived from peer ID which is derived from network key
+		pubNodeID, err := translator.NewPublicNetworkIDTranslator().GetFlowID(peerID)
+		if err != nil {
+			return fmt.Errorf("could not get flow node ID: %w", err)
+		}
+
+		fnb.NodeID = pubNodeID
+		fnb.NetworkKey = networkingPrivateKey
+
+		return nil
+	}
+
+	fnb.NodeID = nodeID
+	fnb.NetworkKey = info.NetworkPrivKey.PrivateKey
+
 	return nil
+}
+
+func peerIDFromNetworkKey(privateKey crypto.PrivateKey) (peer.ID, error) {
+	pubKey, err := keyutils.LibP2PPublicKeyFromFlow(privateKey.PublicKey())
+	if err != nil {
+		return "", fmt.Errorf("could not load libp2p public key: %w", err)
+	}
+
+	return peer.IDFromPublicKey(pubKey)
 }
 
 func (fnb *FlowNodeBuilder) initLogger() error {
@@ -722,11 +943,8 @@ func (fnb *FlowNodeBuilder) initMetrics() error {
 		// metrics enabled, report node info metrics as post init event
 		fnb.PostInit(func(nodeConfig *NodeConfig) error {
 			nodeInfoMetrics := metrics.NewNodeInfoCollector()
-			protocolVersion, err := fnb.RootSnapshot.Params().ProtocolVersion()
-			if err != nil {
-				return fmt.Errorf("could not query root snapshoot protocol version: %w", err)
-			}
-			nodeInfoMetrics.NodeInfo(build.Semver(), build.Commit(), nodeConfig.SporkID.String(), protocolVersion)
+			protocolVersion := fnb.RootSnapshot.Params().ProtocolVersion()
+			nodeInfoMetrics.NodeInfo(build.Version(), build.Commit(), nodeConfig.SporkID.String(), protocolVersion)
 			return nil
 		})
 	}
@@ -754,7 +972,7 @@ func (fnb *FlowNodeBuilder) createGCEProfileUploader(client *gcemd.Client, opts 
 		ProjectID: projectID,
 		ChainID:   chainID,
 		Role:      fnb.NodeConfig.NodeRole,
-		Version:   build.Semver(),
+		Version:   build.Version(),
 		Commit:    build.Commit(),
 		Instance:  instance,
 	}
@@ -973,69 +1191,92 @@ func (fnb *FlowNodeBuilder) initStorage() error {
 	collections := bstorage.NewCollections(fnb.DB, transactions)
 	setups := bstorage.NewEpochSetups(fnb.Metrics.Cache, fnb.DB)
 	epochCommits := bstorage.NewEpochCommits(fnb.Metrics.Cache, fnb.DB)
-	statuses := bstorage.NewEpochStatuses(fnb.Metrics.Cache, fnb.DB)
 	commits := bstorage.NewCommits(fnb.Metrics.Cache, fnb.DB)
+	protocolState := bstorage.NewEpochProtocolStateEntries(fnb.Metrics.Cache, setups, epochCommits, fnb.DB,
+		bstorage.DefaultEpochProtocolStateCacheSize, bstorage.DefaultProtocolStateIndexCacheSize)
+	protocolKVStores := bstorage.NewProtocolKVStore(fnb.Metrics.Cache, fnb.DB,
+		bstorage.DefaultProtocolKVStoreCacheSize, bstorage.DefaultProtocolKVStoreByBlockIDCacheSize)
 	versionBeacons := bstorage.NewVersionBeacons(fnb.DB)
 
 	fnb.Storage = Storage{
-		Headers:            headers,
-		Guarantees:         guarantees,
-		Receipts:           receipts,
-		Results:            results,
-		Seals:              seals,
-		Index:              index,
-		Payloads:           payloads,
-		Blocks:             blocks,
-		QuorumCertificates: qcs,
-		Transactions:       transactions,
-		Collections:        collections,
-		Setups:             setups,
-		EpochCommits:       epochCommits,
-		VersionBeacons:     versionBeacons,
-		Statuses:           statuses,
-		Commits:            commits,
+		Headers:                   headers,
+		Guarantees:                guarantees,
+		Receipts:                  receipts,
+		Results:                   results,
+		Seals:                     seals,
+		Index:                     index,
+		Payloads:                  payloads,
+		Blocks:                    blocks,
+		QuorumCertificates:        qcs,
+		Transactions:              transactions,
+		Collections:               collections,
+		Setups:                    setups,
+		EpochCommits:              epochCommits,
+		VersionBeacons:            versionBeacons,
+		EpochProtocolStateEntries: protocolState,
+		ProtocolKVStore:           protocolKVStores,
+		Commits:                   commits,
 	}
 
 	return nil
 }
 
 func (fnb *FlowNodeBuilder) InitIDProviders() {
-	fnb.Component("disallow list notification distributor", func(node *NodeConfig) (module.ReadyDoneAware, error) {
-		// distributor is returned as a component to be started and stopped.
-		if fnb.NodeDisallowListDistributor == nil {
-			return nil, fmt.Errorf("disallow list notification distributor has not been set")
-		}
-		return fnb.NodeDisallowListDistributor, nil
-	})
 	fnb.Module("id providers", func(node *NodeConfig) error {
 		idCache, err := cache.NewProtocolStateIDCache(node.Logger, node.State, node.ProtocolEvents)
 		if err != nil {
 			return fmt.Errorf("could not initialize ProtocolStateIDCache: %w", err)
 		}
-		node.IDTranslator = idCache
-
-		fnb.NodeDisallowListDistributor = BuildDisallowListNotificationDisseminator(fnb.DisallowListNotificationCacheSize, fnb.MetricsRegisterer, fnb.Logger, fnb.MetricsEnabled)
 
 		// The following wrapper allows to disallow-list byzantine nodes via an admin command:
 		// the wrapper overrides the 'Ejected' flag of disallow-listed nodes to true
-		disallowListWrapper, err := cache.NewNodeBlocklistWrapper(idCache, node.DB, fnb.NodeDisallowListDistributor)
+		disallowListWrapper, err := cache.NewNodeDisallowListWrapper(idCache, node.DB, func() network.DisallowListNotificationConsumer {
+			return fnb.NetworkUnderlay
+		})
 		if err != nil {
 			return fmt.Errorf("could not initialize NodeBlockListWrapper: %w", err)
 		}
 		node.IdentityProvider = disallowListWrapper
 
+		if node.ObserverMode {
+			// identifier providers decides which node to connect to when syncing blocks,
+			// in observer mode, the peer nodes have to be specific public access node,
+			// rather than the staked consensus nodes.
+			idTranslator, factory, err := CreatePublicIDTranslatorAndIdentifierProvider(
+				fnb.Logger,
+				fnb.NetworkKey,
+				fnb.SporkID,
+				// fnb.LibP2PNode is not created yet, until EnqueueNetworkInit is called.
+				// so we pass a function that will return the LibP2PNode when called.
+				func() p2p.LibP2PNode {
+					return fnb.LibP2PNode
+				},
+				idCache,
+			)
+			if err != nil {
+				return fmt.Errorf("could not initialize public ID translator and identifier provider: %w", err)
+			}
+
+			fnb.IDTranslator = idTranslator
+			fnb.SyncEngineIdentifierProvider = factory()
+
+			return nil
+		}
+
+		node.IDTranslator = idCache
+
 		// register the disallow list wrapper for dynamic configuration via admin command
 		err = node.ConfigManager.RegisterIdentifierListConfig("network-id-provider-blocklist",
-			disallowListWrapper.GetBlocklist, disallowListWrapper.Update)
+			disallowListWrapper.GetDisallowList, disallowListWrapper.Update)
 		if err != nil {
-			return fmt.Errorf("failed to register blocklist with config manager: %w", err)
+			return fmt.Errorf("failed to register disallow-list wrapper with config manager: %w", err)
 		}
 
 		node.SyncEngineIdentifierProvider = id.NewIdentityFilterIdentifierProvider(
 			filter.And(
-				filter.HasRole(flow.RoleConsensus),
-				filter.Not(filter.HasNodeID(node.Me.NodeID())),
-				p2p.NotEjectedFilter,
+				filter.HasRole[flow.Identity](flow.RoleConsensus),
+				filter.Not(filter.HasNodeID[flow.Identity](node.Me.NodeID())),
+				filter.NotEjectedFilter,
 			),
 			node.IdentityProvider,
 		)
@@ -1063,7 +1304,8 @@ func (fnb *FlowNodeBuilder) initState() error {
 			fnb.Storage.QuorumCertificates,
 			fnb.Storage.Setups,
 			fnb.Storage.EpochCommits,
-			fnb.Storage.Statuses,
+			fnb.Storage.EpochProtocolStateEntries,
+			fnb.Storage.ProtocolKVStore,
 			fnb.Storage.VersionBeacons,
 		)
 		if err != nil {
@@ -1072,11 +1314,7 @@ func (fnb *FlowNodeBuilder) initState() error {
 		fnb.State = state
 
 		// set root snapshot field
-		rootBlock, err := state.Params().Root()
-		if err != nil {
-			return fmt.Errorf("could not get root block from protocol state: %w", err)
-		}
-
+		rootBlock := state.Params().FinalizedRoot()
 		rootSnapshot := state.AtBlockID(rootBlock.ID())
 		if err := fnb.setRootSnapshot(rootSnapshot); err != nil {
 			return err
@@ -1115,7 +1353,8 @@ func (fnb *FlowNodeBuilder) initState() error {
 			fnb.Storage.QuorumCertificates,
 			fnb.Storage.Setups,
 			fnb.Storage.EpochCommits,
-			fnb.Storage.Statuses,
+			fnb.Storage.EpochProtocolStateEntries,
+			fnb.Storage.ProtocolKVStore,
 			fnb.Storage.VersionBeacons,
 			fnb.RootSnapshot,
 			options...,
@@ -1127,8 +1366,10 @@ func (fnb *FlowNodeBuilder) initState() error {
 		fnb.Logger.Info().
 			Hex("root_result_id", logging.Entity(fnb.RootResult)).
 			Hex("root_state_commitment", fnb.RootSeal.FinalState[:]).
-			Hex("root_block_id", logging.Entity(fnb.RootBlock)).
-			Uint64("root_block_height", fnb.RootBlock.Header.Height).
+			Hex("finalized_root_block_id", logging.Entity(fnb.FinalizedRootBlock)).
+			Uint64("finalized_root_block_height", fnb.FinalizedRootBlock.Header.Height).
+			Hex("sealed_root_block_id", logging.Entity(fnb.SealedRootBlock)).
+			Uint64("sealed_root_block_height", fnb.SealedRootBlock.Header.Height).
 			Msg("protocol state bootstrapped")
 	}
 
@@ -1143,13 +1384,22 @@ func (fnb *FlowNodeBuilder) initState() error {
 	if err != nil {
 		return fmt.Errorf("could not get last finalized block header: %w", err)
 	}
-	fnb.NodeConfig.FinalizedHeader = lastFinalized
+	fnb.NodeConfig.LastFinalizedHeader = lastFinalized
+
+	lastSealed, err := fnb.State.Sealed().Head()
+	if err != nil {
+		return fmt.Errorf("could not get last sealed block header: %w", err)
+	}
 
 	fnb.Logger.Info().
-		Hex("root_block_id", logging.Entity(fnb.RootBlock)).
-		Uint64("root_block_height", fnb.RootBlock.Header.Height).
-		Hex("finalized_block_id", logging.Entity(lastFinalized)).
-		Uint64("finalized_block_height", lastFinalized.Height).
+		Hex("last_finalized_block_id", logging.Entity(lastFinalized)).
+		Uint64("last_finalized_block_height", lastFinalized.Height).
+		Hex("last_sealed_block_id", logging.Entity(lastSealed)).
+		Uint64("last_sealed_block_height", lastSealed.Height).
+		Hex("finalized_root_block_id", logging.Entity(fnb.FinalizedRootBlock)).
+		Uint64("finalized_root_block_height", fnb.FinalizedRootBlock.Header.Height).
+		Hex("sealed_root_block_id", logging.Entity(fnb.SealedRootBlock)).
+		Uint64("sealed_root_block_height", fnb.SealedRootBlock.Header.Height).
 		Msg("successfully opened protocol state")
 
 	return nil
@@ -1185,31 +1435,58 @@ func (fnb *FlowNodeBuilder) setRootSnapshot(rootSnapshot protocol.Snapshot) erro
 		return fmt.Errorf("failed to read root sealing segment: %w", err)
 	}
 
-	fnb.RootBlock = sealingSegment.Highest()
+	fnb.FinalizedRootBlock = sealingSegment.Highest()
+	fnb.SealedRootBlock = sealingSegment.Sealed()
 	fnb.RootQC, err = fnb.RootSnapshot.QuorumCertificate()
 	if err != nil {
 		return fmt.Errorf("failed to read root QC: %w", err)
 	}
 
-	fnb.RootChainID = fnb.RootBlock.Header.ChainID
-	fnb.SporkID, err = fnb.RootSnapshot.Params().SporkID()
-	if err != nil {
-		return fmt.Errorf("failed to read spork ID: %w", err)
-	}
+	fnb.RootChainID = fnb.FinalizedRootBlock.Header.ChainID
+	fnb.SporkID = fnb.RootSnapshot.Params().SporkID()
 
 	return nil
 }
 
 func (fnb *FlowNodeBuilder) initLocal() error {
+	// NodeID has been set in initNodeInfo
+	myID := fnb.NodeID
+	if fnb.ObserverMode {
+		nodeID, err := flow.HexStringToIdentifier(fnb.BaseConfig.nodeIDHex)
+		if err != nil {
+			return fmt.Errorf("could not parse node ID from string (id: %v): %w", fnb.BaseConfig.nodeIDHex, err)
+		}
+		info, err := LoadPrivateNodeInfo(fnb.BaseConfig.BootstrapDir, nodeID)
+		if err != nil {
+			return fmt.Errorf("could not load private node info: %w", err)
+		}
+
+		if info.Role != flow.RoleExecution {
+			return fmt.Errorf("observer mode is only available for execution nodes")
+		}
+
+		id := flow.IdentitySkeleton{
+			// observer mode uses the node id derived from the network key,
+			// rather than the node id from the node info file
+			NodeID:        myID,
+			Address:       info.Address,
+			Role:          info.Role,
+			InitialWeight: 0,
+			NetworkPubKey: fnb.NetworkKey.PublicKey(),
+			StakingPubKey: fnb.StakingKey.PublicKey(),
+		}
+		fnb.Me, err = local.New(id, fnb.StakingKey)
+		if err != nil {
+			return fmt.Errorf("could not initialize local: %w", err)
+		}
+
+		return nil
+	}
+
 	// Verify that my ID (as given in the configuration) is known to the network
 	// (i.e. protocol state). There are two cases that will cause the following error:
 	// 1) used the wrong node id, which is not part of the identity list of the finalized state
 	// 2) the node id is a new one for a new spork, but the bootstrap data has not been updated.
-	myID, err := flow.HexStringToIdentifier(fnb.BaseConfig.nodeIDHex)
-	if err != nil {
-		return fmt.Errorf("could not parse node identifier: %w", err)
-	}
-
 	self, err := fnb.State.Final().Identity(myID)
 	if err != nil {
 		return fmt.Errorf("node identity not found in the identity list of the finalized state (id: %v): %w", myID, err)
@@ -1219,11 +1496,7 @@ func (fnb *FlowNodeBuilder) initLocal() error {
 	// We enforce this strictly for MainNet. For other networks (e.g. TestNet or BenchNet), we
 	// are lenient, to allow ghost node to run as any role.
 	if self.Role.String() != fnb.BaseConfig.NodeRole {
-		rootBlockHeader, err := fnb.State.Params().Root()
-		if err != nil {
-			return fmt.Errorf("could not get root block from protocol state: %w", err)
-		}
-
+		rootBlockHeader := fnb.State.Params().FinalizedRoot()
 		if rootBlockHeader.ChainID == flow.Mainnet {
 			return fmt.Errorf("running as incorrect role, expected: %v, actual: %v, exiting",
 				self.Role.String(),
@@ -1244,7 +1517,7 @@ func (fnb *FlowNodeBuilder) initLocal() error {
 		return fmt.Errorf("configured staking key does not match protocol state")
 	}
 
-	fnb.Me, err = local.New(self, fnb.StakingKey)
+	fnb.Me, err = local.New(self.IdentitySkeleton, fnb.StakingKey)
 	if err != nil {
 		return fmt.Errorf("could not initialize local: %w", err)
 	}
@@ -1253,27 +1526,14 @@ func (fnb *FlowNodeBuilder) initLocal() error {
 }
 
 func (fnb *FlowNodeBuilder) initFvmOptions() {
-	blockFinder := environment.NewBlockFinder(fnb.Storage.Headers)
-	vmOpts := []fvm.Option{
-		fvm.WithChain(fnb.RootChainID.Chain()),
-		fvm.WithBlocks(blockFinder),
-		fvm.WithAccountStorageLimit(true),
-	}
-	if fnb.RootChainID == flow.Testnet || fnb.RootChainID == flow.Sandboxnet || fnb.RootChainID == flow.Mainnet {
-		vmOpts = append(vmOpts,
-			fvm.WithTransactionFeesEnabled(true),
-		)
-	}
-	if fnb.RootChainID == flow.Testnet || fnb.RootChainID == flow.Sandboxnet || fnb.RootChainID == flow.Localnet || fnb.RootChainID == flow.Benchnet {
-		vmOpts = append(vmOpts,
-			fvm.WithContractDeploymentRestricted(false),
-		)
-	}
-	fnb.FvmOptions = vmOpts
+	fnb.FvmOptions = initialize.InitFvmOptions(
+		fnb.RootChainID, fnb.Storage.Headers,
+	)
 }
 
 // handleModules initializes the given module.
 func (fnb *FlowNodeBuilder) handleModule(v namedModuleFunc) error {
+	fnb.Logger.Info().Str("module", v.name).Msg("module initialization started")
 	err := v.fn(fnb.NodeConfig)
 	if err != nil {
 		return fmt.Errorf("module %s initialization failed: %w", v.name, err)
@@ -1294,10 +1554,20 @@ func (fnb *FlowNodeBuilder) handleModules() error {
 	return nil
 }
 
-// handleComponents registers the component's factory method with the ComponentManager to be run
+func (fnb *FlowNodeBuilder) handleComponents() error {
+	AddWorkersFromComponents(fnb.Logger, fnb.NodeConfig, fnb.componentBuilder, fnb.components)
+	return nil
+}
+
+// AddWorkersFromComponents registers the component's factory method with the ComponentManager to be run
 // when the node starts.
 // It uses signal channels to ensure that components are started serially.
-func (fnb *FlowNodeBuilder) handleComponents() error {
+func AddWorkersFromComponents[Input any](
+	log zerolog.Logger,
+	input Input,
+	componentBuilder component.ComponentManagerBuilder,
+	components []NamedComponentFactory[Input],
+) {
 	// The parent/started channels are used to enforce serial startup.
 	// - parent is the started channel of the previous component.
 	// - when a component is ready, it closes its started channel by calling the provided callback.
@@ -1308,27 +1578,22 @@ func (fnb *FlowNodeBuilder) handleComponents() error {
 	parent := make(chan struct{})
 	close(parent)
 
-	var err error
-	asyncComponents := []namedComponentFunc{}
+	asyncComponents := []NamedComponentFactory[Input]{}
 
 	// Run all components
-	for _, f := range fnb.components {
+	for _, f := range components {
 		// Components with explicit dependencies are not started serially
-		if f.dependencies != nil {
+		if f.Dependencies != nil {
 			asyncComponents = append(asyncComponents, f)
 			continue
 		}
 
 		started := make(chan struct{})
 
-		if f.errorHandler != nil {
-			err = fnb.handleRestartableComponent(f, parent, func() { close(started) })
+		if f.ErrorHandler != nil {
+			componentBuilder.AddWorker(WorkerFromRestartableComponent(log, input, f, parent, func() { close(started) }))
 		} else {
-			err = fnb.handleComponent(f, parent, func() { close(started) })
-		}
-
-		if err != nil {
-			return fmt.Errorf("could not handle component %s: %w", f.name, err)
+			componentBuilder.AddWorker(WorkerFromComponent(log, input, f, parent, func() { close(started) }))
 		}
 
 		parent = started
@@ -1337,17 +1602,12 @@ func (fnb *FlowNodeBuilder) handleComponents() error {
 	// Components with explicit dependencies are run asynchronously, which means dependencies in
 	// the dependency list must be initialized outside of the component factory.
 	for _, f := range asyncComponents {
-		fnb.Logger.Debug().Str("component", f.name).Int("dependencies", len(f.dependencies.components)).Msg("handling component asynchronously")
-		err = fnb.handleComponent(f, util.AllReady(f.dependencies.components...), func() {})
-		if err != nil {
-			return fmt.Errorf("could not handle dependable component %s: %w", f.name, err)
-		}
+		log.Debug().Str("component", f.Name).Int("dependencies", len(f.Dependencies.Components)).Msg("handling component asynchronously")
+		componentBuilder.AddWorker(WorkerFromComponent(log, input, f, util.AllReady(f.Dependencies.Components...), func() {}))
 	}
-
-	return nil
 }
 
-// handleComponent constructs a component using the provided ReadyDoneFactory, and registers a
+// WorkerFromComponent constructs a component using the provided ReadyDoneFactory, and registers a
 // worker with the ComponentManager to be run when the node is started.
 //
 // The ComponentManager starts all workers in parallel. Since some components have non-idempotent
@@ -1360,23 +1620,27 @@ func (fnb *FlowNodeBuilder) handleComponents() error {
 // using their ReadyDoneAware interface. After components are updated to use the idempotent
 // ReadyDoneAware interface and explicitly wait for their dependencies to be ready, we can remove
 // this channel chaining.
-func (fnb *FlowNodeBuilder) handleComponent(v namedComponentFunc, dependencies <-chan struct{}, started func()) error {
+func WorkerFromComponent[Input any](log zerolog.Logger, input Input, v NamedComponentFactory[Input], dependencies <-chan struct{}, started func()) component.ComponentWorker {
 	// Add a closure that starts the component when the node is started, and then waits for it to exit
 	// gracefully.
 	// Startup for all components will happen in parallel, and components can use their dependencies'
 	// ReadyDoneAware interface to wait until they are ready.
-	fnb.componentBuilder.AddWorker(func(ctx irrecoverable.SignalerContext, ready component.ReadyFunc) {
+	return func(ctx irrecoverable.SignalerContext, ready component.ReadyFunc) {
 		// wait for the dependencies to be ready before starting
 		if err := util.WaitClosed(ctx, dependencies); err != nil {
 			return
 		}
 
-		logger := fnb.Logger.With().Str("component", v.name).Logger()
+		logger := log.With().Str("component", v.Name).Logger()
 
+		logger.Info().Msg("component initialization started")
 		// First, build the component using the factory method.
-		readyAware, err := v.fn(fnb.NodeConfig)
+		readyAware, err := v.ComponentFactory(input)
 		if err != nil {
-			ctx.Throw(fmt.Errorf("component %s initialization failed: %w", v.name, err))
+			ctx.Throw(fmt.Errorf("component %s initialization failed: %w", v.Name, err))
+		}
+		if readyAware == nil {
+			ctx.Throw(fmt.Errorf("component %s initialization failed: nil component", v.Name))
 		}
 		logger.Info().Msg("component initialization complete")
 
@@ -1412,20 +1676,24 @@ func (fnb *FlowNodeBuilder) handleComponent(v namedComponentFunc, dependencies <
 		// Finally, wait until component has finished shutting down.
 		<-readyAware.Done()
 		logger.Info().Msg("component shutdown complete")
-	})
-
-	return nil
+	}
 }
 
-// handleRestartableComponent constructs a component using the provided ReadyDoneFactory, and
+// WorkerFromRestartableComponent constructs a component using the provided ReadyDoneFactory, and
 // registers a worker with the ComponentManager to be run when the node is started.
 //
 // Restartable Components are components that can be restarted after successfully handling
 // an irrecoverable error.
 //
 // Any irrecoverable errors thrown by the component will be passed to the provided error handler.
-func (fnb *FlowNodeBuilder) handleRestartableComponent(v namedComponentFunc, parentReady <-chan struct{}, started func()) error {
-	fnb.componentBuilder.AddWorker(func(ctx irrecoverable.SignalerContext, ready component.ReadyFunc) {
+func WorkerFromRestartableComponent[Input any](
+	log zerolog.Logger,
+	input Input,
+	v NamedComponentFactory[Input],
+	parentReady <-chan struct{},
+	started func(),
+) component.ComponentWorker {
+	return func(ctx irrecoverable.SignalerContext, ready component.ReadyFunc) {
 		// wait for the previous component to be ready before starting
 		if err := util.WaitClosed(ctx, parentReady); err != nil {
 			return
@@ -1440,11 +1708,12 @@ func (fnb *FlowNodeBuilder) handleRestartableComponent(v namedComponentFunc, par
 		// from within the componentFactory
 		started()
 
-		log := fnb.Logger.With().Str("component", v.name).Logger()
+		log := log.With().Str("component", v.Name).Logger()
 
 		// This may be called multiple times if the component is restarted
 		componentFactory := func() (component.Component, error) {
-			c, err := v.fn(fnb.NodeConfig)
+			log.Info().Msg("component initialization started")
+			c, err := v.ComponentFactory(input)
 			if err != nil {
 				return nil, err
 			}
@@ -1463,15 +1732,13 @@ func (fnb *FlowNodeBuilder) handleRestartableComponent(v namedComponentFunc, par
 			return c.(component.Component), nil
 		}
 
-		err := component.RunComponent(ctx, componentFactory, v.errorHandler)
+		err := component.RunComponent(ctx, componentFactory, v.ErrorHandler)
 		if err != nil && !errors.Is(err, ctx.Err()) {
-			ctx.Throw(fmt.Errorf("component %s encountered an unhandled irrecoverable error: %w", v.name, err))
+			ctx.Throw(fmt.Errorf("component %s encountered an unhandled irrecoverable error: %w", v.Name, err))
 		}
 
 		log.Info().Msg("component shutdown complete")
-	})
-
-	return nil
+	}
 }
 
 // ExtraFlags enables binding additional flags beyond those defined in BaseConfig.
@@ -1506,10 +1773,10 @@ func (fnb *FlowNodeBuilder) AdminCommand(command string, f func(config *NodeConf
 // The ReadyDoneFactory may return either a `Component` or `ReadyDoneAware` instance.
 // In both cases, the object is started when the node is run, and the node will wait for the
 // component to exit gracefully.
-func (fnb *FlowNodeBuilder) Component(name string, f ReadyDoneFactory) NodeBuilder {
-	fnb.components = append(fnb.components, namedComponentFunc{
-		fn:   f,
-		name: name,
+func (fnb *FlowNodeBuilder) Component(name string, f ReadyDoneFactory[*NodeConfig]) NodeBuilder {
+	fnb.components = append(fnb.components, NamedComponentFactory[*NodeConfig]{
+		ComponentFactory: f,
+		Name:             name,
 	})
 	return fnb
 }
@@ -1525,26 +1792,26 @@ func (fnb *FlowNodeBuilder) Component(name string, f ReadyDoneFactory) NodeBuild
 // IMPORTANT: Dependable components are started in parallel with no guaranteed run order, so all
 // dependencies must be initialized outside of the ReadyDoneFactory, and their `Ready()` method
 // MUST be idempotent.
-func (fnb *FlowNodeBuilder) DependableComponent(name string, f ReadyDoneFactory, dependencies *DependencyList) NodeBuilder {
+func (fnb *FlowNodeBuilder) DependableComponent(name string, f ReadyDoneFactory[*NodeConfig], dependencies *DependencyList) NodeBuilder {
 	// Note: dependencies are passed as a struct to allow updating the list after calling this method.
 	// Passing a slice instead would result in out of sync metadata since slices are passed by reference
-	fnb.components = append(fnb.components, namedComponentFunc{
-		fn:           f,
-		name:         name,
-		dependencies: dependencies,
+	fnb.components = append(fnb.components, NamedComponentFactory[*NodeConfig]{
+		ComponentFactory: f,
+		Name:             name,
+		Dependencies:     dependencies,
 	})
 	return fnb
 }
 
 // OverrideComponent adds given builder function to the components set of the node builder. If a builder function with that name
 // already exists, it will be overridden.
-func (fnb *FlowNodeBuilder) OverrideComponent(name string, f ReadyDoneFactory) NodeBuilder {
+func (fnb *FlowNodeBuilder) OverrideComponent(name string, f ReadyDoneFactory[*NodeConfig]) NodeBuilder {
 	for i := 0; i < len(fnb.components); i++ {
-		if fnb.components[i].name == name {
+		if fnb.components[i].Name == name {
 			// found component with the name, override it.
-			fnb.components[i] = namedComponentFunc{
-				fn:   f,
-				name: name,
+			fnb.components[i] = NamedComponentFactory[*NodeConfig]{
+				ComponentFactory: f,
+				Name:             name,
 			}
 
 			return fnb
@@ -1568,11 +1835,11 @@ func (fnb *FlowNodeBuilder) OverrideComponent(name string, f ReadyDoneFactory) N
 // Note: The ReadyDoneFactory method may be called multiple times if the component is restarted.
 //
 // Any irrecoverable errors thrown by the component will be passed to the provided error handler.
-func (fnb *FlowNodeBuilder) RestartableComponent(name string, f ReadyDoneFactory, errorHandler component.OnError) NodeBuilder {
-	fnb.components = append(fnb.components, namedComponentFunc{
-		fn:           f,
-		name:         name,
-		errorHandler: errorHandler,
+func (fnb *FlowNodeBuilder) RestartableComponent(name string, f ReadyDoneFactory[*NodeConfig], errorHandler component.OnError) NodeBuilder {
+	fnb.components = append(fnb.components, NamedComponentFactory[*NodeConfig]{
+		ComponentFactory: f,
+		Name:             name,
+		ErrorHandler:     errorHandler,
 	})
 	return fnb
 }
@@ -1732,6 +1999,8 @@ func (fnb *FlowNodeBuilder) RegisterDefaultAdminCommands() {
 		return common.NewListConfigCommand(config.ConfigManager)
 	}).AdminCommand("read-blocks", func(config *NodeConfig) commands.AdminCommand {
 		return storageCommands.NewReadBlocksCommand(config.State, config.Storage.Blocks)
+	}).AdminCommand("read-range-blocks", func(conf *NodeConfig) commands.AdminCommand {
+		return storageCommands.NewReadRangeBlocksCommand(conf.Storage.Blocks)
 	}).AdminCommand("read-results", func(config *NodeConfig) commands.AdminCommand {
 		return storageCommands.NewReadResultsCommand(config.State, config.Storage.Results)
 	}).AdminCommand("read-seals", func(config *NodeConfig) commands.AdminCommand {
@@ -1758,10 +2027,6 @@ func (fnb *FlowNodeBuilder) Build() (Node, error) {
 }
 
 func (fnb *FlowNodeBuilder) onStart() error {
-
-	// seed random generator
-	rand.Seed(time.Now().UnixNano())
-
 	// init nodeinfo by reading the private bootstrap file if not already set
 	if fnb.NodeID == flow.ZeroID {
 		if err := fnb.initNodeInfo(); err != nil {
@@ -1860,4 +2125,32 @@ func (fnb *FlowNodeBuilder) extraFlagsValidation() error {
 		}
 	}
 	return nil
+}
+
+// DhtSystemActivationStatus parses the given role string and returns the corresponding DHT system activation status.
+// Args:
+// - roleStr: the role string to parse.
+// - enabled: whether the DHT system is configured to be enabled. Only meaningful for access and execution nodes.
+// Returns:
+// - DhtSystemActivation: the corresponding DHT system activation status.
+// - error: if the role string is invalid, returns an error.
+func DhtSystemActivationStatus(roleStr string, enabled bool) (p2pbuilder.DhtSystemActivation, error) {
+	if roleStr == "ghost" {
+		// ghost node is not a valid role, so we don't need to parse it
+		return p2pbuilder.DhtSystemDisabled, nil
+	}
+
+	role, err := flow.ParseRole(roleStr)
+	if err != nil && roleStr != "ghost" {
+		// ghost role is not a valid role, so we don't need to parse it
+		return p2pbuilder.DhtSystemDisabled, fmt.Errorf("could not parse node role: %w", err)
+	}
+
+	// Only access and execution nodes need to run DHT; which is used by bitswap.
+	// Access nodes also run a DHT on the public network for peer discovery of un-staked nodes.
+	if role != flow.RoleAccess && role != flow.RoleExecution {
+		return p2pbuilder.DhtSystemDisabled, nil
+	}
+
+	return p2pbuilder.DhtSystemActivation(enabled), nil
 }

@@ -46,7 +46,7 @@ func (s *EventLoopTestSuite) SetupTest() {
 
 	log := zerolog.New(io.Discard)
 
-	eventLoop, err := NewEventLoop(log, metrics.NewNoopCollector(), s.eh, time.Time{})
+	eventLoop, err := NewEventLoop(log, metrics.NewNoopCollector(), metrics.NewNoopCollector(), s.eh, time.Time{})
 	require.NoError(s.T(), err)
 	s.eventLoop = eventLoop
 
@@ -75,7 +75,7 @@ func (s *EventLoopTestSuite) TestReadyDone() {
 
 // Test_SubmitQC tests that submitted proposal is eventually sent to event handler for processing
 func (s *EventLoopTestSuite) Test_SubmitProposal() {
-	proposal := helper.MakeProposal()
+	proposal := helper.MakeSignedProposal()
 	processed := atomic.NewBool(false)
 	s.eh.On("OnReceiveProposal", proposal).Run(func(args mock.Arguments) {
 		processed.Store(true)
@@ -200,7 +200,8 @@ func TestEventLoop_Timeout(t *testing.T) {
 
 	log := zerolog.New(io.Discard)
 
-	eventLoop, err := NewEventLoop(log, metrics.NewNoopCollector(), eh, time.Time{})
+	metricsCollector := metrics.NewNoopCollector()
+	eventLoop, err := NewEventLoop(log, metricsCollector, metricsCollector, eh, time.Time{})
 	require.NoError(t, err)
 
 	eh.On("TimeoutChannel").Return(time.After(100 * time.Millisecond))
@@ -228,7 +229,7 @@ func TestEventLoop_Timeout(t *testing.T) {
 	go func() {
 		defer wg.Done()
 		for !processed.Load() {
-			eventLoop.SubmitProposal(helper.MakeProposal())
+			eventLoop.SubmitProposal(helper.MakeSignedProposal())
 		}
 	}()
 
@@ -253,11 +254,11 @@ func TestReadyDoneWithStartTime(t *testing.T) {
 
 	startTimeDuration := 2 * time.Second
 	startTime := time.Now().Add(startTimeDuration)
-	eventLoop, err := NewEventLoop(log, metrics, eh, startTime)
+	eventLoop, err := NewEventLoop(log, metrics, metrics, eh, startTime)
 	require.NoError(t, err)
 
 	done := make(chan struct{})
-	eh.On("OnReceiveProposal", mock.AnythingOfType("*model.Proposal")).Run(func(args mock.Arguments) {
+	eh.On("OnReceiveProposal", mock.AnythingOfType("*model.SignedProposal")).Run(func(args mock.Arguments) {
 		require.True(t, time.Now().After(startTime))
 		close(done)
 	}).Return(nil).Once()
@@ -270,7 +271,7 @@ func TestReadyDoneWithStartTime(t *testing.T) {
 
 	parentBlock := unittest.BlockHeaderFixture()
 	block := unittest.BlockHeaderWithParentFixture(parentBlock)
-	eventLoop.SubmitProposal(model.ProposalFromFlow(block))
+	eventLoop.SubmitProposal(model.SignedProposalFromFlow(block))
 
 	unittest.RequireCloseBefore(t, done, startTimeDuration+100*time.Millisecond, "proposal wasn't received")
 	cancel()

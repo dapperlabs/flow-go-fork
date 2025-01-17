@@ -1,6 +1,8 @@
 package main
 
 import (
+	"context"
+
 	"github.com/spf13/pflag"
 
 	"github.com/onflow/flow-go/cmd"
@@ -37,7 +39,7 @@ func main() {
 			return nil
 		}).
 		Component("RPC engine", func(node *cmd.NodeConfig) (module.ReadyDoneAware, error) {
-			rpcEng, err := engine.New(node.Network, node.Logger, node.Me, node.State, rpcConf)
+			rpcEng, err := engine.New(node.EngineRegistry, node.Logger, node.Me, node.State, rpcConf)
 			return rpcEng, err
 		})
 
@@ -45,5 +47,5 @@ func main() {
 	if err != nil {
 		nodeBuilder.Logger.Fatal().Err(err).Send()
 	}
-	node.Run()
+	node.Run(context.Background())
 }

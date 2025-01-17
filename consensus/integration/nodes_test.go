@@ -10,6 +10,7 @@ import (
 
 	"github.com/dgraph-io/badger/v2"
 	"github.com/gammazero/workerpool"
+	"github.com/onflow/crypto"
 	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -28,18 +29,17 @@ import (
 	"github.com/onflow/flow-go/consensus/hotstuff/verification"
 	"github.com/onflow/flow-go/consensus/hotstuff/voteaggregator"
 	"github.com/onflow/flow-go/consensus/hotstuff/votecollector"
-	"github.com/onflow/flow-go/crypto"
 	synceng "github.com/onflow/flow-go/engine/common/synchronization"
 	"github.com/onflow/flow-go/engine/consensus/compliance"
 	"github.com/onflow/flow-go/engine/consensus/message_hub"
 	"github.com/onflow/flow-go/model/bootstrap"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/model/flow/filter"
-	"github.com/onflow/flow-go/model/flow/order"
 	"github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/module/buffer"
 	builder "github.com/onflow/flow-go/module/builder/consensus"
 	synccore "github.com/onflow/flow-go/module/chainsync"
+	modulecompliance "github.com/onflow/flow-go/module/compliance"
 	finalizer "github.com/onflow/flow-go/module/finalizer/consensus"
 	"github.com/onflow/flow-go/module/id"
 	"github.com/onflow/flow-go/module/irrecoverable"
@@ -55,6 +55,8 @@ import (
 	"github.com/onflow/flow-go/state/protocol/blocktimer"
 	"github.com/onflow/flow-go/state/protocol/events"
 	"github.com/onflow/flow-go/state/protocol/inmem"
+	"github.com/onflow/flow-go/state/protocol/protocol_state/kvstore"
+	protocol_state "github.com/onflow/flow-go/state/protocol/protocol_state/state"
 	"github.com/onflow/flow-go/state/protocol/util"
 	storage "github.com/onflow/flow-go/storage/badger"
 	storagemock "github.com/onflow/flow-go/storage/mock"
@@ -187,14 +189,14 @@ func buildEpochLookupList(epochs ...protocol.Epoch) []epochInfo {
 // The list of created nodes, the common network hub, and a function which starts
 // all the nodes together, is returned.
 func createNodes(t *testing.T, participants *ConsensusParticipants, rootSnapshot protocol.Snapshot, stopper *Stopper) (nodes []*Node, hub *Hub, runFor func(time.Duration)) {
-	consensus, err := rootSnapshot.Identities(filter.HasRole(flow.RoleConsensus))
+	consensus, err := rootSnapshot.Identities(filter.HasRole[flow.Identity](flow.RoleConsensus))
 	require.NoError(t, err)
 
 	epochViewLookup := buildEpochLookupList(rootSnapshot.Epochs().Current(),
 		rootSnapshot.Epochs().Next())
 
 	epochLookup := &mockmodule.EpochLookup{}
-	epochLookup.On("EpochForViewWithFallback", mock.Anything).Return(
+	epochLookup.On("EpochForView", mock.Anything).Return(
 		func(view uint64) uint64 {
 			for _, info := range epochViewLookup {
 				if view <= info.finalView {
@@ -250,22 +252,22 @@ func createRootQC(t *testing.T, root *flow.Block, participantData *run.Participa
 
 // createRootBlockData creates genesis block with first epoch and real data node identities.
 // This function requires all participants to pass DKG process.
-func createRootBlockData(participantData *run.ParticipantData) (*flow.Block, *flow.ExecutionResult, *flow.Seal) {
+func createRootBlockData(t *testing.T, participantData *run.ParticipantData) (*flow.Block, *flow.ExecutionResult, *flow.Seal) {
 	root := unittest.GenesisFixture()
 	consensusParticipants := participantData.Identities()
 
 	// add other roles to create a complete identity list
 	participants := unittest.CompleteIdentitySet(consensusParticipants...)
-	participants.Sort(order.Canonical)
+	participants.Sort(flow.Canonical[flow.Identity])
 
 	dkgParticipantsKeys := make([]crypto.PublicKey, 0, len(consensusParticipants))
-	for _, participant := range participants.Filter(filter.HasRole(flow.RoleConsensus)) {
+	for _, participant := range participants.Filter(filter.HasRole[flow.Identity](flow.RoleConsensus)) {
 		dkgParticipantsKeys = append(dkgParticipantsKeys, participantData.Lookup[participant.NodeID].KeyShare)
 	}
 
 	counter := uint64(1)
 	setup := unittest.EpochSetupFixture(
-		unittest.WithParticipants(participants),
+		unittest.WithParticipants(participants.ToSkeleton()),
 		unittest.SetupWithCounter(counter),
 		unittest.WithFirstView(root.Header.View),
 		unittest.WithFinalView(root.Header.View+1000),
@@ -279,6 +281,12 @@ func createRootBlockData(participantData *run.ParticipantData) (*flow.Block, *fl
 		},
 	)
 
+	epochProtocolStateID := inmem.EpochProtocolStateFromServiceEvents(setup, commit).ID()
+	safetyParams, err := protocol.DefaultEpochSafetyParams(root.Header.ChainID)
+	require.NoError(t, err)
+	rootProtocolState, err := kvstore.NewDefaultKVStore(safetyParams.FinalizationSafetyThreshold, safetyParams.EpochExtensionViewCount, epochProtocolStateID)
+	require.NoError(t, err)
+	root.SetPayload(flow.Payload{ProtocolStateID: rootProtocolState.ID()})
 	result := unittest.BootstrapExecutionResultFixture(root, unittest.GenesisStateCommitment)
 	result.ServiceEvents = []flow.ServiceEvent{setup.ServiceEvent(), commit.ServiceEvent()}
 
@@ -288,7 +296,7 @@ func createRootBlockData(participantData *run.ParticipantData) (*flow.Block, *fl
 }
 
 func createPrivateNodeIdentities(n int) []bootstrap.NodeInfo {
-	consensus := unittest.IdentityListFixture(n, unittest.WithRole(flow.RoleConsensus)).Sort(order.Canonical)
+	consensus := unittest.IdentityListFixture(n, unittest.WithRole(flow.RoleConsensus)).Sort(flow.Canonical[flow.Identity])
 	infos := make([]bootstrap.NodeInfo, 0, n)
 	for _, node := range consensus {
 		networkPrivKey := unittest.NetworkingPrivKeyFixture()
@@ -297,7 +305,7 @@ func createPrivateNodeIdentities(n int) []bootstrap.NodeInfo {
 			node.NodeID,
 			node.Role,
 			node.Address,
-			node.Weight,
+			node.InitialWeight,
 			networkPrivKey,
 			stakingPrivKey,
 		)
@@ -340,7 +348,7 @@ func completeConsensusIdentities(t *testing.T, nodeInfos []bootstrap.NodeInfo) *
 // createRootSnapshot creates root block, generates root QC and builds a root snapshot for
 // bootstrapping a node
 func createRootSnapshot(t *testing.T, participantData *run.ParticipantData) *inmem.Snapshot {
-	root, result, seal := createRootBlockData(participantData)
+	root, result, seal := createRootBlockData(t, participantData)
 	rootQC := createRootQC(t, root, participantData)
 
 	rootSnapshot, err := inmem.SnapshotFromBootstrapState(root, result, seal, rootQC)
@@ -374,9 +382,12 @@ func createNode(
 	qcsDB := storage.NewQuorumCertificates(metricsCollector, db, storage.DefaultCacheSize)
 	setupsDB := storage.NewEpochSetups(metricsCollector, db)
 	commitsDB := storage.NewEpochCommits(metricsCollector, db)
-	statusesDB := storage.NewEpochStatuses(metricsCollector, db)
+	protocolStateDB := storage.NewEpochProtocolStateEntries(metricsCollector, setupsDB, commitsDB, db,
+		storage.DefaultEpochProtocolStateCacheSize, storage.DefaultProtocolStateIndexCacheSize)
+	protocokKVStoreDB := storage.NewProtocolKVStore(metricsCollector, db,
+		storage.DefaultProtocolKVStoreCacheSize, storage.DefaultProtocolKVStoreByBlockIDCacheSize)
 	versionBeaconDB := storage.NewVersionBeacons(db)
-	consumer := events.NewDistributor()
+	protocolStateEvents := events.NewDistributor()
 
 	localID := identity.ID()
 
@@ -395,7 +406,8 @@ func createNode(
 		qcsDB,
 		setupsDB,
 		commitsDB,
-		statusesDB,
+		protocolStateDB,
+		protocokKVStoreDB,
 		versionBeaconDB,
 		rootSnapshot,
 	)
@@ -407,7 +419,7 @@ func createNode(
 	fullState, err := bprotocol.NewFullConsensusState(
 		log,
 		tracer,
-		consumer,
+		protocolStateEvents,
 		state,
 		indexDB,
 		payloadsDB,
@@ -434,16 +446,16 @@ func createNode(
 
 	// log with node index
 	logConsumer := notifications.NewLogConsumer(log)
-	notifier := pubsub.NewDistributor()
-	notifier.AddConsumer(counterConsumer)
-	notifier.AddConsumer(logConsumer)
+	hotstuffDistributor := pubsub.NewDistributor()
+	hotstuffDistributor.AddConsumer(counterConsumer)
+	hotstuffDistributor.AddConsumer(logConsumer)
 
 	require.Equal(t, participant.nodeInfo.NodeID, localID)
 	privateKeys, err := participant.nodeInfo.PrivateKeys()
 	require.NoError(t, err)
 
 	// make local
-	me, err := local.New(identity, privateKeys.StakingKey)
+	me, err := local.New(identity.IdentitySkeleton, privateKeys.StakingKey)
 	require.NoError(t, err)
 
 	// add a network for this node to the hub
@@ -457,9 +469,34 @@ func createNode(
 
 	seals := stdmap.NewIncorporatedResultSeals(sealLimit)
 
+	mutableProtocolState := protocol_state.NewMutableProtocolState(
+		log,
+		protocolStateDB,
+		protocokKVStoreDB,
+		state.Params(),
+		headersDB,
+		resultsDB,
+		setupsDB,
+		commitsDB,
+	)
+
 	// initialize the block builder
-	build, err := builder.NewBuilder(metricsCollector, db, fullState, headersDB, sealsDB, indexDB, blocksDB, resultsDB, receiptsDB,
-		guarantees, consensusMempools.NewIncorporatedResultSeals(seals, receiptsDB), receipts, tracer)
+	build, err := builder.NewBuilder(
+		metricsCollector,
+		db,
+		fullState,
+		headersDB,
+		sealsDB,
+		indexDB,
+		blocksDB,
+		resultsDB,
+		receiptsDB,
+		mutableProtocolState,
+		guarantees,
+		consensusMempools.NewIncorporatedResultSeals(seals, receiptsDB),
+		receipts,
+		tracer,
+	)
 	require.NoError(t, err)
 
 	// initialize the pending blocks cache
@@ -471,10 +508,9 @@ func createNode(
 	rootQC, err := rootSnapshot.QuorumCertificate()
 	require.NoError(t, err)
 
-	// selector := filter.HasRole(flow.RoleConsensus)
 	committee, err := committees.NewConsensusCommittee(state, localID)
 	require.NoError(t, err)
-	consumer.AddConsumer(committee)
+	protocolStateEvents.AddConsumer(committee)
 
 	// initialize the block finalizer
 	final := finalizer.NewFinalizer(db, headersDB, fullState, trace.NewNoopTracer())
@@ -485,7 +521,7 @@ func createNode(
 	voteAggregationDistributor := pubsub.NewVoteAggregationDistributor()
 	voteAggregationDistributor.AddVoteAggregationConsumer(logConsumer)
 
-	forks, err := consensus.NewForks(rootHeader, headersDB, final, notifier, rootHeader, rootQC)
+	forks, err := consensus.NewForks(rootHeader, headersDB, final, hotstuffDistributor, rootHeader, rootQC)
 	require.NoError(t, err)
 
 	validator := consensus.NewValidator(metricsCollector, committee)
@@ -548,7 +584,12 @@ func createNode(
 		timeoutAggregationDistributor,
 		timeoutProcessorFactory,
 	)
-	timeoutCollectors := timeoutaggregator.NewTimeoutCollectors(log, livenessData.CurrentView, timeoutCollectorsFactory)
+	timeoutCollectors := timeoutaggregator.NewTimeoutCollectors(
+		log,
+		metricsCollector,
+		livenessData.CurrentView,
+		timeoutCollectorsFactory,
+	)
 
 	timeoutAggregator, err := timeoutaggregator.NewTimeoutAggregator(
 		log,
@@ -563,7 +604,7 @@ func createNode(
 	hotstuffModules := &consensus.HotstuffModules{
 		Forks:                       forks,
 		Validator:                   validator,
-		Notifier:                    notifier,
+		Notifier:                    hotstuffDistributor,
 		Committee:                   committee,
 		Signer:                      signer,
 		Persist:                     persist,
@@ -576,6 +617,7 @@ func createNode(
 	// initialize hotstuff
 	hot, err := consensus.NewParticipant(
 		log,
+		metricsCollector,
 		metricsCollector,
 		build,
 		rootHeader,
@@ -595,7 +637,7 @@ func createNode(
 		metricsCollector,
 		metricsCollector,
 		metricsCollector,
-		notifier,
+		hotstuffDistributor,
 		tracer,
 		headersDB,
 		payloadsDB,
@@ -606,6 +648,7 @@ func createNode(
 		hot,
 		voteAggregator,
 		timeoutAggregator,
+		modulecompliance.DefaultConfig(),
 	)
 	require.NoError(t, err)
 
@@ -613,11 +656,14 @@ func createNode(
 	require.NoError(t, err)
 
 	identities, err := state.Final().Identities(filter.And(
-		filter.HasRole(flow.RoleConsensus),
-		filter.Not(filter.HasNodeID(me.NodeID())),
+		filter.HasRole[flow.Identity](flow.RoleConsensus),
+		filter.Not(filter.HasNodeID[flow.Identity](me.NodeID())),
 	))
 	require.NoError(t, err)
 	idProvider := id.NewFixedIdentifierProvider(identities.NodeIDs())
+
+	spamConfig, err := synceng.NewSpamDetectionConfig()
+	require.NoError(t, err, "could not initialize spam detection config")
 
 	// initialize the synchronization engine
 	sync, err := synceng.New(
@@ -630,6 +676,7 @@ func createNode(
 		comp,
 		syncCore,
 		idProvider,
+		spamConfig,
 		func(cfg *synceng.Config) {
 			// use a small pool and scan interval for sync engine
 			cfg.ScanInterval = 500 * time.Millisecond
@@ -652,7 +699,7 @@ func createNode(
 	)
 	require.NoError(t, err)
 
-	notifier.AddConsumer(messageHub)
+	hotstuffDistributor.AddConsumer(messageHub)
 
 	node.compliance = comp
 	node.sync = sync

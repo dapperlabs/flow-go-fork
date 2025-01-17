@@ -20,26 +20,26 @@ import (
 type ComplianceEngineFactory struct {
 	log            zerolog.Logger
 	me             module.Local
-	net            network.Network
+	net            network.EngineRegistry
 	colMetrics     module.CollectionMetrics
 	engMetrics     module.EngineMetrics
 	mempoolMetrics module.MempoolMetrics
 	protoState     protocol.State
 	transactions   storage.Transactions
-	complianceOpts []modulecompliance.Opt
+	config         modulecompliance.Config
 }
 
 // NewComplianceEngineFactory returns a new collection compliance engine factory.
 func NewComplianceEngineFactory(
 	log zerolog.Logger,
-	net network.Network,
+	net network.EngineRegistry,
 	me module.Local,
 	colMetrics module.CollectionMetrics,
 	engMetrics module.EngineMetrics,
 	mempoolMetrics module.MempoolMetrics,
 	protoState protocol.State,
 	transactions storage.Transactions,
-	complianceOpts ...modulecompliance.Opt,
+	config modulecompliance.Config,
 ) (*ComplianceEngineFactory, error) {
 
 	factory := &ComplianceEngineFactory{
@@ -51,7 +51,7 @@ func NewComplianceEngineFactory(
 		mempoolMetrics: mempoolMetrics,
 		protoState:     protoState,
 		transactions:   transactions,
-		complianceOpts: complianceOpts,
+		config:         config,
 	}
 	return factory, nil
 }
@@ -85,7 +85,7 @@ func (f *ComplianceEngineFactory) Create(
 		hot,
 		voteAggregator,
 		timeoutAggregator,
-		f.complianceOpts...,
+		f.config,
 	)
 	if err != nil {
 		return nil, fmt.Errorf("could create cluster compliance core: %w", err)

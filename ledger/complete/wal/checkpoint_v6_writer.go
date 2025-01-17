@@ -10,6 +10,7 @@ import (
 	"path"
 	"path/filepath"
 
+	"github.com/docker/go-units"
 	"github.com/hashicorp/go-multierror"
 	"github.com/rs/zerolog"
 
@@ -18,6 +19,7 @@ import (
 	"github.com/onflow/flow-go/ledger/complete/mtrie/node"
 	"github.com/onflow/flow-go/ledger/complete/mtrie/trie"
 	utilsio "github.com/onflow/flow-go/utils/io"
+	"github.com/onflow/flow-go/utils/merr"
 )
 
 const subtrieLevel = 4
@@ -29,13 +31,13 @@ func subtrieCountByLevel(level uint16) int {
 
 // StoreCheckpointV6SingleThread stores checkpoint file in v6 in a single threaded manner,
 // useful when EN is executing block.
-func StoreCheckpointV6SingleThread(tries []*trie.MTrie, outputDir string, outputFile string, logger *zerolog.Logger) error {
+func StoreCheckpointV6SingleThread(tries []*trie.MTrie, outputDir string, outputFile string, logger zerolog.Logger) error {
 	return StoreCheckpointV6(tries, outputDir, outputFile, logger, 1)
 }
 
 // StoreCheckpointV6Concurrently stores checkpoint file in v6 in max workers,
 // useful during state extraction
-func StoreCheckpointV6Concurrently(tries []*trie.MTrie, outputDir string, outputFile string, logger *zerolog.Logger) error {
+func StoreCheckpointV6Concurrently(tries []*trie.MTrie, outputDir string, outputFile string, logger zerolog.Logger) error {
 	return StoreCheckpointV6(tries, outputDir, outputFile, logger, 16)
 }
 
@@ -49,7 +51,7 @@ func StoreCheckpointV6Concurrently(tries []*trie.MTrie, outputDir string, output
 //
 // nWorker specifies how many workers to encode subtrie concurrently, valid range [1,16]
 func StoreCheckpointV6(
-	tries []*trie.MTrie, outputDir string, outputFile string, logger *zerolog.Logger, nWorker uint) error {
+	tries []*trie.MTrie, outputDir string, outputFile string, logger zerolog.Logger, nWorker uint) error {
 	err := storeCheckpointV6(tries, outputDir, outputFile, logger, nWorker)
 	if err != nil {
 		cleanupErr := deleteCheckpointFiles(outputDir, outputFile)
@@ -63,7 +65,7 @@ func StoreCheckpointV6(
 }
 
 func storeCheckpointV6(
-	tries []*trie.MTrie, outputDir string, outputFile string, logger *zerolog.Logger, nWorker uint) error {
+	tries []*trie.MTrie, outputDir string, outputFile string, logger zerolog.Logger, nWorker uint) error {
 	if len(tries) == 0 {
 		logger.Info().Msg("no tries to be checkpointed")
 		return nil
@@ -79,8 +81,10 @@ func storeCheckpointV6(
 	lg.Info().
 		Str("first_hash", first.RootHash().String()).
 		Uint64("first_reg_count", first.AllocatedRegCount()).
+		Str("first_reg_size", units.BytesSize(float64(first.AllocatedRegSize()))).
 		Str("last_hash", last.RootHash().String()).
 		Uint64("last_reg_count", last.AllocatedRegCount()).
+		Str("last_reg_size", units.BytesSize(float64(last.AllocatedRegSize()))).
 		Msg("storing checkpoint")
 
 	// make sure a checkpoint file with same name doesn't exist
@@ -103,7 +107,7 @@ func storeCheckpointV6(
 		subTrieRootAndTopLevelTrieCount(tries),
 		outputDir,
 		outputFile,
-		&lg,
+		lg,
 		nWorker,
 	)
 	if err != nil {
@@ -113,12 +117,12 @@ func storeCheckpointV6(
 	lg.Info().Msgf("subtrie have been stored. sub trie node count: %v", subTriesNodeCount)
 
 	topTrieChecksum, err := storeTopLevelNodesAndTrieRoots(
-		tries, subTrieRootIndices, subTriesNodeCount, outputDir, outputFile, &lg)
+		tries, subTrieRootIndices, subTriesNodeCount, outputDir, outputFile, lg)
 	if err != nil {
 		return fmt.Errorf("could not store top level tries: %w", err)
 	}
 
-	err = storeCheckpointHeader(subTrieChecksums, topTrieChecksum, outputDir, outputFile, &lg)
+	err = storeCheckpointHeader(subTrieChecksums, topTrieChecksum, outputDir, outputFile, lg)
 	if err != nil {
 		return fmt.Errorf("could not store checkpoint header: %w", err)
 	}
@@ -136,7 +140,7 @@ func storeCheckpointHeader(
 	topTrieChecksum uint32,
 	outputDir string,
 	outputFile string,
-	logger *zerolog.Logger,
+	logger zerolog.Logger,
 ) (
 	errToReturn error,
 ) {
@@ -207,7 +211,7 @@ func storeTopLevelNodesAndTrieRoots(
 	subTriesNodeCount uint64,
 	outputDir string,
 	outputFile string,
-	logger *zerolog.Logger,
+	logger zerolog.Logger,
 ) (
 	checksumOfTopTriePartFile uint32,
 	errToReturn error,
@@ -319,7 +323,7 @@ func storeSubTrieConcurrently(
 	subAndTopNodeCount int, // useful for preallocating memory for the node indices map to be returned
 	outputDir string,
 	outputFile string,
-	logger *zerolog.Logger,
+	logger zerolog.Logger,
 	nWorker uint,
 ) (
 	map[*node.Node]uint64, // node indices
@@ -399,13 +403,13 @@ func storeSubTrieConcurrently(
 	return results, nodeCounter, checksums, nil
 }
 
-func createWriterForTopTries(dir string, file string, logger *zerolog.Logger) (io.WriteCloser, error) {
+func createWriterForTopTries(dir string, file string, logger zerolog.Logger) (io.WriteCloser, error) {
 	_, topTriesFileName := filePathTopTries(dir, file)
 
 	return createClosableWriter(dir, topTriesFileName, logger)
 }
 
-func createWriterForSubtrie(dir string, file string, logger *zerolog.Logger, index int) (io.WriteCloser, error) {
+func createWriterForSubtrie(dir string, file string, logger zerolog.Logger, index int) (io.WriteCloser, error) {
 	_, subTriesFileName, err := filePathSubTries(dir, file, index)
 	if err != nil {
 		return nil, err
@@ -414,7 +418,7 @@ func createWriterForSubtrie(dir string, file string, logger *zerolog.Logger, ind
 	return createClosableWriter(dir, subTriesFileName, logger)
 }
 
-func createClosableWriter(dir string, fileName string, logger *zerolog.Logger) (io.WriteCloser, error) {
+func createClosableWriter(dir string, fileName string, logger zerolog.Logger) (io.WriteCloser, error) {
 	fullPath := path.Join(dir, fileName)
 	if utilsio.FileExists(fullPath) {
 		return nil, fmt.Errorf("checkpoint part file %v already exists", fullPath)
@@ -447,7 +451,7 @@ func storeCheckpointSubTrie(
 	estimatedSubtrieNodeCount int, // for estimate the amount of memory to be preallocated
 	outputDir string,
 	outputFile string,
-	logger *zerolog.Logger,
+	logger zerolog.Logger,
 ) (
 	rootNodesOfAllSubtries map[*node.Node]uint64, // the stored position of each unique root node
 	totalSubtrieNodeCount uint64,
@@ -705,36 +709,26 @@ func decodeSubtrieCount(encoded []byte) (uint16, error) {
 	return binary.BigEndian.Uint16(encoded), nil
 }
 
-// closeAndMergeError close the closable and merge the closeErr with the given err into a multierror
-// Note: when using this function in a defer function, don't use as below:
-// func XXX() (
-//
-//	err error,
-//	) {
-//		def func() {
-//			// bad, because the definition of err might get overwritten
-//			err = closeAndMergeError(closable, err)
-//		}()
-//
-// Better to use as below:
-// func XXX() (
-//
-//	errToReturn error,
-//	) {
-//		def func() {
-//			// good, because the error to returned is only updated here, and guaranteed to be returned
-//			errToReturn = closeAndMergeError(closable, errToReturn)
-//		}()
-func closeAndMergeError(closable io.Closer, err error) error {
-	var merr *multierror.Error
+var closeAndMergeError = merr.CloseAndMergeError
+
+// withFile opens the file at the given path, and calls the given function with the opened file.
+// it handles closing the file and evicting the file from Linux page cache.
+func withFile(logger zerolog.Logger, filepath string, f func(file *os.File) error) (
+	errToReturn error,
+) {
+
+	file, err := os.Open(filepath)
 	if err != nil {
-		merr = multierror.Append(merr, err)
+		return fmt.Errorf("could not open file %v: %w", filepath, err)
 	}
+	defer func(file *os.File) {
+		evictErr := evictFileFromLinuxPageCache(file, false, logger)
+		if evictErr != nil {
+			logger.Warn().Msgf("failed to evict top trie file %s from Linux page cache: %s", filepath, evictErr)
+			// No need to return this error because it's possible to continue normal operations.
+		}
+		errToReturn = closeAndMergeError(file, errToReturn)
+	}(file)
 
-	closeError := closable.Close()
-	if closeError != nil {
-		merr = multierror.Append(merr, closeError)
-	}
-
-	return merr.ErrorOrNil()
+	return f(file)
 }

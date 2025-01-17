@@ -9,7 +9,6 @@ import (
 	"github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/module/metrics"
 	"github.com/onflow/flow-go/storage"
-	badgermodel "github.com/onflow/flow-go/storage/badger/model"
 	"github.com/onflow/flow-go/storage/badger/operation"
 	"github.com/onflow/flow-go/storage/badger/transaction"
 )
@@ -17,28 +16,25 @@ import (
 type ChunkDataPacks struct {
 	db             *badger.DB
 	collections    storage.Collections
-	byChunkIDCache *Cache
+	byChunkIDCache *Cache[flow.Identifier, *storage.StoredChunkDataPack]
 }
 
 func NewChunkDataPacks(collector module.CacheMetrics, db *badger.DB, collections storage.Collections, byChunkIDCacheSize uint) *ChunkDataPacks {
 
-	store := func(key interface{}, val interface{}) func(*transaction.Tx) error {
-		chdp := val.(*badgermodel.StoredChunkDataPack)
-		return transaction.WithTx(operation.SkipDuplicates(operation.InsertChunkDataPack(chdp)))
+	store := func(key flow.Identifier, val *storage.StoredChunkDataPack) func(*transaction.Tx) error {
+		return transaction.WithTx(operation.SkipDuplicates(operation.InsertChunkDataPack(val)))
 	}
 
-	retrieve := func(key interface{}) func(tx *badger.Txn) (interface{}, error) {
-		chunkID := key.(flow.Identifier)
-
-		var c badgermodel.StoredChunkDataPack
-		return func(tx *badger.Txn) (interface{}, error) {
-			err := operation.RetrieveChunkDataPack(chunkID, &c)(tx)
+	retrieve := func(key flow.Identifier) func(tx *badger.Txn) (*storage.StoredChunkDataPack, error) {
+		return func(tx *badger.Txn) (*storage.StoredChunkDataPack, error) {
+			var c storage.StoredChunkDataPack
+			err := operation.RetrieveChunkDataPack(key, &c)(tx)
 			return &c, err
 		}
 	}
 
 	cache := newCache(collector, metrics.ResourceChunkDataPack,
-		withLimit(byChunkIDCacheSize),
+		withLimit[flow.Identifier, *storage.StoredChunkDataPack](byChunkIDCacheSize),
 		withStore(store),
 		withRetrieve(retrieve),
 	)
@@ -51,22 +47,22 @@ func NewChunkDataPacks(collector module.CacheMetrics, db *badger.DB, collections
 	return &ch
 }
 
-func (ch *ChunkDataPacks) Store(c *flow.ChunkDataPack) error {
-	sc := toStoredChunkDataPack(c)
-	err := operation.RetryOnConflictTx(ch.db, transaction.Update, ch.byChunkIDCache.PutTx(sc.ChunkID, sc))
-	if err != nil {
-		return fmt.Errorf("could not store chunk datapack: %w", err)
-	}
-	return nil
-}
+// Remove removes multiple ChunkDataPacks cs keyed by their ChunkIDs in a batch.
+// No errors are expected during normal operation, even if no entries are matched.
+func (ch *ChunkDataPacks) Remove(chunkIDs []flow.Identifier) error {
+	batch := NewBatch(ch.db)
 
-func (ch *ChunkDataPacks) Remove(chunkID flow.Identifier) error {
-	err := operation.RetryOnConflict(ch.db.Update, operation.RemoveChunkDataPack(chunkID))
-	if err != nil {
-		return fmt.Errorf("could not remove chunk datapack: %w", err)
+	for _, c := range chunkIDs {
+		err := ch.BatchRemove(c, batch)
+		if err != nil {
+			return fmt.Errorf("cannot remove chunk data pack: %w", err)
+		}
 	}
-	// TODO Integrate cache removal in a similar way as storage/retrieval is
-	ch.byChunkIDCache.Remove(chunkID)
+
+	err := batch.Flush()
+	if err != nil {
+		return fmt.Errorf("cannot flush batch to remove chunk data pack: %w", err)
+	}
 	return nil
 }
 
@@ -74,12 +70,30 @@ func (ch *ChunkDataPacks) Remove(chunkID flow.Identifier) error {
 // No errors are expected during normal operation, but it may return generic error
 // if entity is not serializable or Badger unexpectedly fails to process request
 func (ch *ChunkDataPacks) BatchStore(c *flow.ChunkDataPack, batch storage.BatchStorage) error {
-	sc := toStoredChunkDataPack(c)
+	sc := storage.ToStoredChunkDataPack(c)
 	writeBatch := batch.GetWriter()
 	batch.OnSucceed(func() {
 		ch.byChunkIDCache.Insert(sc.ChunkID, sc)
 	})
 	return operation.BatchInsertChunkDataPack(sc)(writeBatch)
+}
+
+// Store stores multiple ChunkDataPacks cs keyed by their ChunkIDs in a batch.
+// No errors are expected during normal operation, but it may return generic error
+func (ch *ChunkDataPacks) Store(cs []*flow.ChunkDataPack) error {
+	batch := NewBatch(ch.db)
+	for _, c := range cs {
+		err := ch.BatchStore(c, batch)
+		if err != nil {
+			return fmt.Errorf("cannot store chunk data pack: %w", err)
+		}
+	}
+
+	err := batch.Flush()
+	if err != nil {
+		return fmt.Errorf("cannot flush batch: %w", err)
+	}
+	return nil
 }
 
 // BatchRemove removes ChunkDataPack c keyed by its ChunkID in provided batch
@@ -100,9 +114,10 @@ func (ch *ChunkDataPacks) ByChunkID(chunkID flow.Identifier) (*flow.ChunkDataPac
 	}
 
 	chdp := &flow.ChunkDataPack{
-		ChunkID:    schdp.ChunkID,
-		StartState: schdp.StartState,
-		Proof:      schdp.Proof,
+		ChunkID:           schdp.ChunkID,
+		StartState:        schdp.StartState,
+		Proof:             schdp.Proof,
+		ExecutionDataRoot: schdp.ExecutionDataRoot,
 	}
 
 	if !schdp.SystemChunk {
@@ -117,7 +132,7 @@ func (ch *ChunkDataPacks) ByChunkID(chunkID flow.Identifier) (*flow.ChunkDataPac
 	return chdp, nil
 }
 
-func (ch *ChunkDataPacks) byChunkID(chunkID flow.Identifier) (*badgermodel.StoredChunkDataPack, error) {
+func (ch *ChunkDataPacks) byChunkID(chunkID flow.Identifier) (*storage.StoredChunkDataPack, error) {
 	tx := ch.db.NewTransaction(false)
 	defer tx.Discard()
 
@@ -129,30 +144,12 @@ func (ch *ChunkDataPacks) byChunkID(chunkID flow.Identifier) (*badgermodel.Store
 	return schdp, nil
 }
 
-func (ch *ChunkDataPacks) retrieveCHDP(chunkID flow.Identifier) func(*badger.Txn) (*badgermodel.StoredChunkDataPack, error) {
-	return func(tx *badger.Txn) (*badgermodel.StoredChunkDataPack, error) {
+func (ch *ChunkDataPacks) retrieveCHDP(chunkID flow.Identifier) func(*badger.Txn) (*storage.StoredChunkDataPack, error) {
+	return func(tx *badger.Txn) (*storage.StoredChunkDataPack, error) {
 		val, err := ch.byChunkIDCache.Get(chunkID)(tx)
 		if err != nil {
 			return nil, err
 		}
-		return val.(*badgermodel.StoredChunkDataPack), nil
+		return val, nil
 	}
-}
-
-func toStoredChunkDataPack(c *flow.ChunkDataPack) *badgermodel.StoredChunkDataPack {
-	sc := &badgermodel.StoredChunkDataPack{
-		ChunkID:     c.ChunkID,
-		StartState:  c.StartState,
-		Proof:       c.Proof,
-		SystemChunk: false,
-	}
-
-	if c.Collection != nil {
-		// non system chunk
-		sc.CollectionID = c.Collection.ID()
-	} else {
-		sc.SystemChunk = true
-	}
-
-	return sc
 }

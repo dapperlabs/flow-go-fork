@@ -22,7 +22,7 @@ import (
 	"github.com/onflow/flow-go/engine/consensus/matching"
 	"github.com/onflow/flow-go/engine/consensus/sealing"
 	"github.com/onflow/flow-go/engine/execution/computation"
-	"github.com/onflow/flow-go/engine/execution/ingestion"
+	executionIngest "github.com/onflow/flow-go/engine/execution/ingestion"
 	executionprovider "github.com/onflow/flow-go/engine/execution/provider"
 	"github.com/onflow/flow-go/engine/execution/state"
 	"github.com/onflow/flow-go/engine/verification/assigner"
@@ -79,6 +79,11 @@ type GenericNode struct {
 	Payloads           storage.Payloads
 	Blocks             storage.Blocks
 	QuorumCertificates storage.QuorumCertificates
+	Results            storage.ExecutionResults
+	Setups             storage.EpochSetups
+	EpochCommits       storage.EpochCommits
+	EpochProtocolState storage.EpochProtocolStateEntries
+	ProtocolKVStore    storage.ProtocolKVStore
 	State              protocol.ParticipantState
 	Index              storage.Index
 	Me                 module.Local
@@ -135,6 +140,7 @@ func (n CollectionNode) Start(t *testing.T) {
 	n.IngestionEngine.Start(n.Ctx)
 	n.EpochManagerEngine.Start(n.Ctx)
 	n.ProviderEngine.Start(n.Ctx)
+	n.PusherEngine.Start(n.Ctx)
 }
 
 func (n CollectionNode) Ready() <-chan struct{} {
@@ -187,7 +193,7 @@ func (cn ConsensusNode) Done() {
 type ExecutionNode struct {
 	GenericNode
 	FollowerState       protocol.FollowerState
-	IngestionEngine     *ingestion.Engine
+	IngestionEngine     *executionIngest.Core
 	ExecutionEngine     *computation.Manager
 	RequestEngine       *requester.Engine
 	ReceiptsEngine      *executionprovider.Engine
@@ -203,6 +209,7 @@ type ExecutionNode struct {
 	Collections         storage.Collections
 	Finalizer           *consensus.Finalizer
 	MyExecutionReceipts storage.MyExecutionReceipts
+	StorehouseEnabled   bool
 }
 
 func (en ExecutionNode) Ready(ctx context.Context) {
@@ -211,8 +218,10 @@ func (en ExecutionNode) Ready(ctx context.Context) {
 	// new interface.
 	irctx, _ := irrecoverable.WithSignaler(ctx)
 	en.ReceiptsEngine.Start(irctx)
+	en.IngestionEngine.Start(irctx)
 	en.FollowerCore.Start(irctx)
 	en.FollowerEngine.Start(irctx)
+	en.SyncEngine.Start(irctx)
 
 	<-util.AllReady(
 		en.Ledger,
@@ -232,7 +241,6 @@ func (en ExecutionNode) Done(cancelFunc context.CancelFunc) {
 	// to stop all (deprecated) ready-done-aware
 	<-util.AllDone(
 		en.IngestionEngine,
-		en.IngestionEngine,
 		en.ReceiptsEngine,
 		en.Ledger,
 		en.FollowerCore,
@@ -246,12 +254,23 @@ func (en ExecutionNode) Done(cancelFunc context.CancelFunc) {
 }
 
 func (en ExecutionNode) AssertHighestExecutedBlock(t *testing.T, header *flow.Header) {
-
-	height, blockID, err := en.ExecutionState.GetHighestExecutedBlockID(context.Background())
+	height, blockID, err := en.ExecutionState.GetLastExecutedBlockID(context.Background())
 	require.NoError(t, err)
 
 	require.Equal(t, header.ID(), blockID)
 	require.Equal(t, header.Height, height)
+}
+
+func (en ExecutionNode) AssertBlockIsExecuted(t *testing.T, header *flow.Header) {
+	executed, err := en.ExecutionState.IsBlockExecuted(header.Height, header.ID())
+	require.NoError(t, err)
+	require.True(t, executed)
+}
+
+func (en ExecutionNode) AssertBlockNotExecuted(t *testing.T, header *flow.Header) {
+	executed, err := en.ExecutionState.IsBlockExecuted(header.Height, header.ID())
+	require.NoError(t, err)
+	require.False(t, executed)
 }
 
 // VerificationNode implements an in-process verification node for tests.

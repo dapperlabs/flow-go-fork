@@ -38,11 +38,13 @@ type TestPaceMaker struct {
 
 var _ hotstuff.PaceMaker = (*TestPaceMaker)(nil)
 
-func NewTestPaceMaker(timeoutController *timeout.Controller,
+func NewTestPaceMaker(
+	timeoutController *timeout.Controller,
+	proposalDelayProvider hotstuff.ProposalDurationProvider,
 	notifier hotstuff.Consumer,
 	persist hotstuff.Persister,
 ) *TestPaceMaker {
-	p, err := pacemaker.New(timeoutController, notifier, persist)
+	p, err := pacemaker.New(timeoutController, proposalDelayProvider, notifier, persist)
 	if err != nil {
 		panic(err)
 	}
@@ -74,18 +76,12 @@ func (p *TestPaceMaker) LastViewTC() *flow.TimeoutCertificate {
 // using a real pacemaker for testing event handler
 func initPaceMaker(t require.TestingT, ctx context.Context, livenessData *hotstuff.LivenessData) hotstuff.PaceMaker {
 	notifier := &mocks.Consumer{}
-	tc, err := timeout.NewConfig(
-		time.Duration(minRepTimeout*1e6),
-		time.Duration(maxRepTimeout*1e6),
-		multiplicativeIncrease,
-		happyPathMaxRoundFailures,
-		0,
-		time.Duration(maxRepTimeout*1e6))
+	tc, err := timeout.NewConfig(time.Duration(minRepTimeout*1e6), time.Duration(maxRepTimeout*1e6), multiplicativeIncrease, happyPathMaxRoundFailures, time.Duration(maxRepTimeout*1e6))
 	require.NoError(t, err)
 	persist := &mocks.Persister{}
 	persist.On("PutLivenessData", mock.Anything).Return(nil).Maybe()
 	persist.On("GetLivenessData").Return(livenessData, nil).Once()
-	pm := NewTestPaceMaker(timeout.NewController(tc), notifier, persist)
+	pm := NewTestPaceMaker(timeout.NewController(tc), pacemaker.NoProposalDelay(), notifier, persist)
 	notifier.On("OnStartingTimeout", mock.Anything).Return()
 	notifier.On("OnQcTriggeredViewChange", mock.Anything, mock.Anything, mock.Anything).Return()
 	notifier.On("OnTcTriggeredViewChange", mock.Anything, mock.Anything, mock.Anything).Return()
@@ -136,14 +132,14 @@ func NewSafetyRules(t *testing.T) *SafetyRules {
 
 	// SafetyRules will not vote for any block, unless the blockID exists in votable map
 	safetyRules.On("ProduceVote", mock.Anything, mock.Anything).Return(
-		func(block *model.Proposal, _ uint64) *model.Vote {
+		func(block *model.SignedProposal, _ uint64) *model.Vote {
 			_, ok := safetyRules.votable[block.Block.BlockID]
 			if !ok {
 				return nil
 			}
 			return createVote(block.Block)
 		},
-		func(block *model.Proposal, _ uint64) error {
+		func(block *model.SignedProposal, _ uint64) error {
 			_, ok := safetyRules.votable[block.Block.BlockID]
 			if !ok {
 				return model.NewNoVoteErrorf("block not found")
@@ -183,7 +179,7 @@ func NewForks(t *testing.T, finalized uint64) *Forks {
 	}
 
 	f.On("AddValidatedBlock", mock.Anything).Return(func(proposal *model.Block) error {
-		log.Info().Msgf("forks.AddValidatedBlock received Proposal for view: %v, QC: %v\n", proposal.View, proposal.QC.View)
+		log.Info().Msgf("forks.AddValidatedBlock received Block proposal for view: %v, QC: %v\n", proposal.View, proposal.QC.View)
 		return f.addProposal(proposal)
 	}).Maybe()
 
@@ -232,14 +228,12 @@ type BlockProducer struct {
 }
 
 func (b *BlockProducer) MakeBlockProposal(view uint64, qc *flow.QuorumCertificate, lastViewTC *flow.TimeoutCertificate) (*flow.Header, error) {
-	return model.ProposalToFlow(&model.Proposal{
-		Block: helper.MakeBlock(
+	return helper.SignedProposalToFlow(helper.MakeSignedProposal(helper.WithProposal(
+		helper.MakeProposal(helper.WithBlock(helper.MakeBlock(
 			helper.WithBlockView(view),
 			helper.WithBlockQC(qc),
-			helper.WithBlockProposer(b.proposerID),
-		),
-		LastViewTC: lastViewTC,
-	}), nil
+			helper.WithBlockProposer(b.proposerID))),
+			helper.WithLastViewTC(lastViewTC))))), nil
 }
 
 func TestEventHandler(t *testing.T) {
@@ -262,8 +256,8 @@ type EventHandlerSuite struct {
 
 	initView       uint64 // the current view at the beginning of the test case
 	endView        uint64 // the expected current view at the end of the test case
-	parentProposal *model.Proposal
-	votingProposal *model.Proposal
+	parentProposal *model.SignedProposal
+	votingProposal *model.SignedProposal
 	qc             *flow.QuorumCertificate
 	tc             *flow.TimeoutCertificate
 	newview        *model.NewViewEvent
@@ -674,7 +668,7 @@ func (es *EventHandlerSuite) TestOnReceiveTc_NextLeaderProposes() {
 
 		// proposed block should contain valid newest QC and lastViewTC
 		expectedNewestQC := es.paceMaker.NewestQC()
-		proposal := model.ProposalFromFlow(header)
+		proposal := model.SignedProposalFromFlow(header)
 		require.Equal(es.T(), expectedNewestQC, proposal.Block.QC)
 		require.Equal(es.T(), es.paceMaker.LastViewTC(), proposal.LastViewTC)
 	}).Once()
@@ -770,6 +764,8 @@ func (es *EventHandlerSuite) Test100Timeout() {
 
 // TestLeaderBuild100Blocks tests scenario where leader builds 100 proposals one after another
 func (es *EventHandlerSuite) TestLeaderBuild100Blocks() {
+	require.Equal(es.T(), 1, len(es.forks.proposals), "expect Forks to contain only root block")
+
 	// I'm the leader for the first view
 	es.committee.leaders[es.initView] = struct{}{}
 
@@ -809,7 +805,8 @@ func (es *EventHandlerSuite) TestLeaderBuild100Blocks() {
 	}
 
 	require.Equal(es.T(), es.endView, es.paceMaker.CurView(), "incorrect view change")
-	require.Equal(es.T(), totalView, (len(es.forks.proposals)-1)/2)
+	require.Equal(es.T(), totalView+1, len(es.forks.proposals), "expect Forks to contain root block + 100 proposed blocks")
+	es.notifier.AssertExpectations(es.T())
 }
 
 // TestFollowerFollows100Blocks tests scenario where follower receives 100 proposals one after another
@@ -1034,10 +1031,7 @@ func createVote(block *model.Block) *model.Vote {
 	}
 }
 
-func createProposal(view uint64, qcview uint64) *model.Proposal {
+func createProposal(view uint64, qcview uint64) *model.SignedProposal {
 	block := createBlockWithQC(view, qcview)
-	return &model.Proposal{
-		Block:   block,
-		SigData: nil,
-	}
+	return helper.MakeSignedProposal(helper.WithProposal(helper.MakeProposal(helper.WithBlock(block))))
 }

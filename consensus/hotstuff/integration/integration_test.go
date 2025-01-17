@@ -21,7 +21,6 @@ const safeTimeout = 2 * time.Second
 const happyPathMaxRoundFailures = 6
 
 func TestSingleInstance(t *testing.T) {
-
 	// set up a single instance to run
 	// NOTE: currently, the HotStuff logic will infinitely call back on itself
 	// with a single instance, leading to a boundlessly growing call stack,
@@ -52,7 +51,7 @@ func TestThreeInstances(t *testing.T) {
 	// generate three hotstuff participants
 	participants := unittest.IdentityListFixture(num)
 	root := DefaultRoot()
-	timeouts, err := timeout.NewConfig(safeTimeout, safeTimeout, 1.5, happyPathMaxRoundFailures, 0, safeTimeout)
+	timeouts, err := timeout.NewConfig(safeTimeout, safeTimeout, 1.5, happyPathMaxRoundFailures, safeTimeout)
 	require.NoError(t, err)
 
 	// set up three instances that are exactly the same
@@ -116,7 +115,7 @@ func TestSevenInstances(t *testing.T) {
 	participants := unittest.IdentityListFixture(numPass + numFail)
 	instances := make([]*Instance, 0, numPass+numFail)
 	root := DefaultRoot()
-	timeouts, err := timeout.NewConfig(safeTimeout, safeTimeout, 1.5, happyPathMaxRoundFailures, 0, safeTimeout)
+	timeouts, err := timeout.NewConfig(safeTimeout, safeTimeout, 1.5, happyPathMaxRoundFailures, safeTimeout)
 	require.NoError(t, err)
 
 	// set up five instances that work fully

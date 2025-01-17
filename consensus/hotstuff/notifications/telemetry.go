@@ -38,7 +38,10 @@ type TelemetryConsumer struct {
 	noPathLogger zerolog.Logger
 }
 
+// Telemetry implements consumers for _all happy-path_ interfaces in consensus/hotstuff/notifications/telemetry.go:
 var _ hotstuff.ParticipantConsumer = (*TelemetryConsumer)(nil)
+var _ hotstuff.CommunicatorConsumer = (*TelemetryConsumer)(nil)
+var _ hotstuff.FinalizationConsumer = (*TelemetryConsumer)(nil)
 var _ hotstuff.VoteCollectorConsumer = (*TelemetryConsumer)(nil)
 var _ hotstuff.TimeoutCollectorConsumer = (*TelemetryConsumer)(nil)
 
@@ -57,7 +60,7 @@ func (t *TelemetryConsumer) OnStart(currentView uint64) {
 	t.pathHandler.NextStep().Msg("OnStart")
 }
 
-func (t *TelemetryConsumer) OnReceiveProposal(currentView uint64, proposal *model.Proposal) {
+func (t *TelemetryConsumer) OnReceiveProposal(currentView uint64, proposal *model.SignedProposal) {
 	block := proposal.Block
 	t.pathHandler.StartNextPath(currentView)
 	step := t.pathHandler.NextStep().

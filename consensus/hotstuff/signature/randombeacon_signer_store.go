@@ -4,7 +4,8 @@ import (
 	"errors"
 	"fmt"
 
-	"github.com/onflow/flow-go/crypto"
+	"github.com/onflow/crypto"
+
 	"github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/storage"
 )
@@ -35,7 +36,7 @@ func NewEpochAwareRandomBeaconKeyStore(epochLookup module.EpochLookup, keys stor
 //   - (nil, module.ErrNoBeaconKeyForEpoch) if beacon key for epoch is unavailable
 //   - (nil, error) if there is any exception
 func (s *EpochAwareRandomBeaconKeyStore) ByView(view uint64) (crypto.PrivateKey, error) {
-	epoch, err := s.epochLookup.EpochForViewWithFallback(view)
+	epoch, err := s.epochLookup.EpochForView(view)
 	if err != nil {
 		return nil, fmt.Errorf("could not get epoch by view %v: %w", view, err)
 	}

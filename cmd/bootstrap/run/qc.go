@@ -3,6 +3,7 @@ package run
 import (
 	"fmt"
 
+	"github.com/onflow/crypto"
 	"github.com/rs/zerolog"
 
 	"github.com/onflow/flow-go/consensus/hotstuff"
@@ -12,7 +13,6 @@ import (
 	"github.com/onflow/flow-go/consensus/hotstuff/validator"
 	"github.com/onflow/flow-go/consensus/hotstuff/verification"
 	"github.com/onflow/flow-go/consensus/hotstuff/votecollector"
-	"github.com/onflow/flow-go/crypto"
 	"github.com/onflow/flow-go/model/bootstrap"
 	"github.com/onflow/flow-go/model/dkg"
 	"github.com/onflow/flow-go/model/flow"
@@ -28,6 +28,17 @@ type ParticipantData struct {
 	Participants []Participant
 	Lookup       map[flow.Identifier]flow.DKGParticipant
 	GroupKey     crypto.PublicKey
+}
+
+// PublicBeaconKeys returns the nodes' individual public random-beacon keys (excluding
+// the group public key). The keys are returned in the same order as the nodes appear
+// in the Participants list, which must be the DKG index order.
+func (pd *ParticipantData) PublicBeaconKeys() []crypto.PublicKey {
+	keys := make([]crypto.PublicKey, len(pd.Participants))
+	for i, participant := range pd.Participants {
+		keys[i] = participant.RandomBeaconPrivKey.PublicKey()
+	}
+	return keys
 }
 
 func (pd *ParticipantData) Identities() flow.IdentityList {
@@ -120,7 +131,7 @@ func GenerateRootBlockVotes(block *flow.Block, participantData *ParticipantData)
 		if err != nil {
 			return nil, fmt.Errorf("could not get private keys for participant: %w", err)
 		}
-		me, err := local.New(p.Identity(), keys.StakingKey)
+		me, err := local.New(p.Identity().IdentitySkeleton, keys.StakingKey)
 		if err != nil {
 			return nil, err
 		}
@@ -158,7 +169,7 @@ func GenerateQCParticipantData(allNodes, internalNodes []bootstrap.NodeInfo, dkg
 
 	// length of DKG participants needs to match stakingNodes, since we run DKG for external and internal validators
 	if len(allNodes) != len(dkgData.PrivKeyShares) {
-		return nil, fmt.Errorf("need exactly the same number of staking public keys as DKG private participants")
+		return nil, fmt.Errorf("need exactly the same number of staking public keys as DKG private participants, (all=%d, dkg=%d)", len(allNodes), len(dkgData.PrivKeyShares))
 	}
 
 	qcData := &ParticipantData{}

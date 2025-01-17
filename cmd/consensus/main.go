@@ -1,8 +1,7 @@
-// (c) 2019 Dapper Labs - ALL RIGHTS RESERVED
-
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -14,12 +13,14 @@ import (
 
 	client "github.com/onflow/flow-go-sdk/access/grpc"
 	"github.com/onflow/flow-go-sdk/crypto"
+
 	"github.com/onflow/flow-go/cmd"
 	"github.com/onflow/flow-go/cmd/util/cmd/common"
 	"github.com/onflow/flow-go/consensus"
 	"github.com/onflow/flow-go/consensus/hotstuff"
 	"github.com/onflow/flow-go/consensus/hotstuff/blockproducer"
 	"github.com/onflow/flow-go/consensus/hotstuff/committees"
+	"github.com/onflow/flow-go/consensus/hotstuff/cruisectl"
 	"github.com/onflow/flow-go/consensus/hotstuff/notifications"
 	"github.com/onflow/flow-go/consensus/hotstuff/notifications/pubsub"
 	"github.com/onflow/flow-go/consensus/hotstuff/pacemaker/timeout"
@@ -48,10 +49,10 @@ import (
 	builder "github.com/onflow/flow-go/module/builder/consensus"
 	"github.com/onflow/flow-go/module/chainsync"
 	chmodule "github.com/onflow/flow-go/module/chunks"
-	modulecompliance "github.com/onflow/flow-go/module/compliance"
 	dkgmodule "github.com/onflow/flow-go/module/dkg"
 	"github.com/onflow/flow-go/module/epochs"
 	finalizer "github.com/onflow/flow-go/module/finalizer/consensus"
+	"github.com/onflow/flow-go/module/grpcclient"
 	"github.com/onflow/flow-go/module/mempool"
 	consensusMempools "github.com/onflow/flow-go/module/mempool/consensus"
 	"github.com/onflow/flow-go/module/mempool/stdmap"
@@ -65,6 +66,7 @@ import (
 	badgerState "github.com/onflow/flow-go/state/protocol/badger"
 	"github.com/onflow/flow-go/state/protocol/blocktimer"
 	"github.com/onflow/flow-go/state/protocol/events/gadgets"
+	protocol_state "github.com/onflow/flow-go/state/protocol/protocol_state/state"
 	"github.com/onflow/flow-go/storage"
 	bstorage "github.com/onflow/flow-go/storage/badger"
 	"github.com/onflow/flow-go/utils/io"
@@ -73,59 +75,65 @@ import (
 func main() {
 
 	var (
-		guaranteeLimit                       uint
-		resultLimit                          uint
-		approvalLimit                        uint
-		sealLimit                            uint
-		pendingReceiptsLimit                 uint
-		minInterval                          time.Duration
-		maxInterval                          time.Duration
-		maxSealPerBlock                      uint
-		maxGuaranteePerBlock                 uint
-		hotstuffMinTimeout                   time.Duration
-		hotstuffTimeoutAdjustmentFactor      float64
-		hotstuffHappyPathMaxRoundFailures    uint64
-		blockRateDelay                       time.Duration
-		chunkAlpha                           uint
-		requiredApprovalsForSealVerification uint
-		requiredApprovalsForSealConstruction uint
-		emergencySealing                     bool
-		dkgControllerConfig                  dkgmodule.ControllerConfig
-		dkgMessagingEngineConfig             = dkgeng.DefaultMessagingEngineConfig()
-		startupTimeString                    string
-		startupTime                          time.Time
+		guaranteeLimit                        uint
+		resultLimit                           uint
+		approvalLimit                         uint
+		sealLimit                             uint
+		pendingReceiptsLimit                  uint
+		minInterval                           time.Duration
+		maxInterval                           time.Duration
+		maxSealPerBlock                       uint
+		maxGuaranteePerBlock                  uint
+		hotstuffMinTimeout                    time.Duration
+		hotstuffTimeoutAdjustmentFactor       float64
+		hotstuffHappyPathMaxRoundFailures     uint64
+		chunkAlpha                            uint
+		requiredApprovalsForSealVerification  uint
+		requiredApprovalsForSealConstruction  uint
+		emergencySealing                      bool
+		dkgMessagingEngineConfig              = dkgeng.DefaultMessagingEngineConfig()
+		cruiseCtlConfig                       = cruisectl.DefaultConfig()
+		cruiseCtlFallbackProposalDurationFlag time.Duration
+		cruiseCtlMinViewDurationFlag          time.Duration
+		cruiseCtlMaxViewDurationFlag          time.Duration
+		cruiseCtlEnabledFlag                  bool
+		startupTimeString                     string
+		startupTime                           time.Time
 
 		// DKG contract client
 		machineAccountInfo *bootstrap.NodeMachineAccountInfo
-		flowClientConfigs  []*common.FlowClientConfig
+		flowClientConfigs  []*grpcclient.FlowClientConfig
 		insecureAccessAPI  bool
 		accessNodeIDS      []string
 
-		err                 error
-		mutableState        protocol.ParticipantState
-		beaconPrivateKey    *encodable.RandomBeaconPrivKey
-		guarantees          mempool.Guarantees
-		receipts            mempool.ExecutionTree
-		seals               mempool.IncorporatedResultSeals
-		pendingReceipts     mempool.PendingReceipts
-		receiptRequester    *requester.Engine
-		syncCore            *chainsync.Core
-		comp                *compliance.Engine
-		hot                 module.HotStuff
-		conMetrics          module.ConsensusMetrics
-		mainMetrics         module.HotstuffMetrics
-		receiptValidator    module.ReceiptValidator
-		chunkAssigner       *chmodule.ChunkAssigner
-		followerDistributor *pubsub.FollowerDistributor
-		dkgBrokerTunnel     *dkgmodule.BrokerTunnel
-		blockTimer          protocol.BlockTimer
-		committee           *committees.Consensus
-		epochLookup         *epochs.EpochLookup
-		hotstuffModules     *consensus.HotstuffModules
-		dkgState            *bstorage.DKGState
-		safeBeaconKeys      *bstorage.SafeBeaconPrivateKeys
-		getSealingConfigs   module.SealingConfigsGetter
+		err                   error
+		mutableState          protocol.ParticipantState
+		beaconPrivateKey      *encodable.RandomBeaconPrivKey
+		guarantees            mempool.Guarantees
+		receipts              mempool.ExecutionTree
+		seals                 mempool.IncorporatedResultSeals
+		pendingReceipts       mempool.PendingReceipts
+		receiptRequester      *requester.Engine
+		syncCore              *chainsync.Core
+		comp                  *compliance.Engine
+		hot                   module.HotStuff
+		conMetrics            module.ConsensusMetrics
+		machineAccountMetrics module.MachineAccountMetrics
+		mainMetrics           module.HotstuffMetrics
+		receiptValidator      module.ReceiptValidator
+		chunkAssigner         *chmodule.ChunkAssigner
+		followerDistributor   *pubsub.FollowerDistributor
+		dkgBrokerTunnel       *dkgmodule.BrokerTunnel
+		blockTimer            protocol.BlockTimer
+		proposalDurProvider   hotstuff.ProposalDurationProvider
+		committee             *committees.Consensus
+		epochLookup           *epochs.EpochLookup
+		hotstuffModules       *consensus.HotstuffModules
+		dkgState              *bstorage.DKGState
+		safeBeaconKeys        *bstorage.SafeBeaconPrivateKeys
+		getSealingConfigs     module.SealingConfigsGetter
 	)
+	var deprecatedFlagBlockRateDelay time.Duration
 
 	nodeBuilder := cmd.FlowNode(flow.RoleConsensus.String())
 	nodeBuilder.ExtraFlags(func(flags *pflag.FlagSet) {
@@ -140,23 +148,24 @@ func main() {
 		flags.DurationVar(&maxInterval, "max-interval", 90*time.Second, "the maximum amount of time between two blocks")
 		flags.UintVar(&maxSealPerBlock, "max-seal-per-block", 100, "the maximum number of seals to be included in a block")
 		flags.UintVar(&maxGuaranteePerBlock, "max-guarantee-per-block", 100, "the maximum number of collection guarantees to be included in a block")
-		flags.DurationVar(&hotstuffMinTimeout, "hotstuff-min-timeout", 2500*time.Millisecond, "the lower timeout bound for the hotstuff pacemaker, this is also used as initial timeout")
+		flags.DurationVar(&hotstuffMinTimeout, "hotstuff-min-timeout", 1045*time.Millisecond, "the lower timeout bound for the hotstuff pacemaker, this is also used as initial timeout")
 		flags.Float64Var(&hotstuffTimeoutAdjustmentFactor, "hotstuff-timeout-adjustment-factor", timeout.DefaultConfig.TimeoutAdjustmentFactor, "adjustment of timeout duration in case of time out event")
 		flags.Uint64Var(&hotstuffHappyPathMaxRoundFailures, "hotstuff-happy-path-max-round-failures", timeout.DefaultConfig.HappyPathMaxRoundFailures, "number of failed rounds before first timeout increase")
-		flags.DurationVar(&blockRateDelay, "block-rate-delay", 500*time.Millisecond, "the delay to broadcast block proposal in order to control block production rate")
+		flags.DurationVar(&cruiseCtlFallbackProposalDurationFlag, "cruise-ctl-fallback-proposal-duration", cruiseCtlConfig.FallbackProposalDelay.Load(), "the proposal duration value to use when the controller is disabled, or in epoch fallback mode. In those modes, this value has the same as the old `--block-rate-delay`")
+		flags.DurationVar(&cruiseCtlMinViewDurationFlag, "cruise-ctl-min-view-duration", cruiseCtlConfig.MinViewDuration.Load(), "the lower bound of authority for the controller, when active. This is the smallest amount of time a view is allowed to take.")
+		flags.DurationVar(&cruiseCtlMaxViewDurationFlag, "cruise-ctl-max-view-duration", cruiseCtlConfig.MaxViewDuration.Load(), "the upper bound of authority for the controller when active. This is the largest amount of time a view is allowed to take.")
+		flags.BoolVar(&cruiseCtlEnabledFlag, "cruise-ctl-enabled", cruiseCtlConfig.Enabled.Load(), "whether the block time controller is enabled; when disabled, the FallbackProposalDelay is used")
 		flags.UintVar(&chunkAlpha, "chunk-alpha", flow.DefaultChunkAssignmentAlpha, "number of verifiers that should be assigned to each chunk")
 		flags.UintVar(&requiredApprovalsForSealVerification, "required-verification-seal-approvals", flow.DefaultRequiredApprovalsForSealValidation, "minimum number of approvals that are required to verify a seal")
 		flags.UintVar(&requiredApprovalsForSealConstruction, "required-construction-seal-approvals", flow.DefaultRequiredApprovalsForSealConstruction, "minimum number of approvals that are required to construct a seal")
 		flags.BoolVar(&emergencySealing, "emergency-sealing-active", flow.DefaultEmergencySealingActive, "(de)activation of emergency sealing")
 		flags.BoolVar(&insecureAccessAPI, "insecure-access-api", false, "required if insecure GRPC connection should be used")
 		flags.StringSliceVar(&accessNodeIDS, "access-node-ids", []string{}, fmt.Sprintf("array of access node IDs sorted in priority order where the first ID in this array will get the first connection attempt and each subsequent ID after serves as a fallback. Minimum length %d. Use '*' for all IDs in protocol state.", common.DefaultAccessNodeIDSMinimum))
-		flags.DurationVar(&dkgControllerConfig.BaseStartDelay, "dkg-controller-base-start-delay", dkgmodule.DefaultBaseStartDelay, "used to define the range for jitter prior to DKG start (eg. 500µs) - the base value is scaled quadratically with the # of DKG participants")
-		flags.DurationVar(&dkgControllerConfig.BaseHandleFirstBroadcastDelay, "dkg-controller-base-handle-first-broadcast-delay", dkgmodule.DefaultBaseHandleFirstBroadcastDelay, "used to define the range for jitter prior to DKG handling the first broadcast messages (eg. 50ms) - the base value is scaled quadratically with the # of DKG participants")
-		flags.DurationVar(&dkgControllerConfig.HandleSubsequentBroadcastDelay, "dkg-controller-handle-subsequent-broadcast-delay", dkgmodule.DefaultHandleSubsequentBroadcastDelay, "used to define the constant delay introduced prior to DKG handling subsequent broadcast messages (eg. 2s)")
 		flags.DurationVar(&dkgMessagingEngineConfig.RetryBaseWait, "dkg-messaging-engine-retry-base-wait", dkgMessagingEngineConfig.RetryBaseWait, "the inter-attempt wait time for the first attempt (base of exponential retry)")
 		flags.Uint64Var(&dkgMessagingEngineConfig.RetryMax, "dkg-messaging-engine-retry-max", dkgMessagingEngineConfig.RetryMax, "the maximum number of retry attempts for an outbound DKG message")
 		flags.Uint64Var(&dkgMessagingEngineConfig.RetryJitterPercent, "dkg-messaging-engine-retry-jitter-percent", dkgMessagingEngineConfig.RetryJitterPercent, "the percentage of jitter to apply to each inter-attempt wait time")
 		flags.StringVar(&startupTimeString, "hotstuff-startup-time", cmd.NotSet, "specifies date and time (in ISO 8601 format) after which the consensus participant may enter the first view (e.g 1996-04-24T15:04:05-07:00)")
+		flags.DurationVar(&deprecatedFlagBlockRateDelay, "block-rate-delay", 0, "[deprecated in v0.30; Jun 2023] Use `cruise-ctl-*` flags instead, this flag has no effect and will eventually be removed")
 	}).ValidateFlags(func() error {
 		nodeBuilder.Logger.Info().Str("startup_time_str", startupTimeString).Msg("got startup_time_str")
 		if startupTimeString != cmd.NotSet {
@@ -166,6 +175,23 @@ func main() {
 			}
 			startupTime = t
 			nodeBuilder.Logger.Info().Time("startup_time", startupTime).Msg("got startup_time")
+		}
+		// convert local flag variables to atomic config variables, for dynamically updatable fields
+		if cruiseCtlEnabledFlag != cruiseCtlConfig.Enabled.Load() {
+			cruiseCtlConfig.Enabled.Store(cruiseCtlEnabledFlag)
+		}
+		if cruiseCtlFallbackProposalDurationFlag != cruiseCtlConfig.FallbackProposalDelay.Load() {
+			cruiseCtlConfig.FallbackProposalDelay.Store(cruiseCtlFallbackProposalDurationFlag)
+		}
+		if cruiseCtlMinViewDurationFlag != cruiseCtlConfig.MinViewDuration.Load() {
+			cruiseCtlConfig.MinViewDuration.Store(cruiseCtlMinViewDurationFlag)
+		}
+		if cruiseCtlMaxViewDurationFlag != cruiseCtlConfig.MaxViewDuration.Load() {
+			cruiseCtlConfig.MaxViewDuration.Store(cruiseCtlMaxViewDurationFlag)
+		}
+		// log a warning about deprecated flags
+		if deprecatedFlagBlockRateDelay > 0 {
+			nodeBuilder.Logger.Warn().Msg("A deprecated flag was specified (--block-rate-delay). This flag is deprecated as of v0.30 (Jun 2023), has no effect, and will eventually be removed.")
 		}
 		return nil
 	})
@@ -177,8 +203,16 @@ func main() {
 	nodeBuilder.
 		PreInit(cmd.DynamicStartPreInit).
 		ValidateRootSnapshot(badgerState.ValidRootSnapshotContainsEntityExpiryRange).
+		Module("machine account config", func(node *cmd.NodeConfig) error {
+			machineAccountInfo, err = cmd.LoadNodeMachineAccountInfoFile(node.BootstrapDir, node.NodeID)
+			return err
+		}).
 		Module("consensus node metrics", func(node *cmd.NodeConfig) error {
 			conMetrics = metrics.NewConsensusCollector(node.Tracer, node.MetricsRegisterer)
+			return nil
+		}).
+		Module("machine account metrics", func(node *cmd.NodeConfig) error {
+			machineAccountMetrics = metrics.NewMachineAccountCollector(node.MetricsRegisterer, machineAccountInfo.FlowAddress())
 			return nil
 		}).
 		Module("dkg state", func(node *cmd.NodeConfig) error {
@@ -270,7 +304,7 @@ func main() {
 			// their first beacon private key through the DKG in the EpochSetup phase
 			// prior to their first epoch as network participant).
 
-			rootSnapshot := node.State.AtBlockID(node.RootBlock.ID())
+			rootSnapshot := node.State.AtBlockID(node.FinalizedRootBlock.ID())
 			isSporkRoot, err := protocol.IsSporkRootSnapshot(rootSnapshot)
 			if err != nil {
 				return fmt.Errorf("could not check whether root snapshot is spork root: %w", err)
@@ -290,7 +324,7 @@ func main() {
 				return fmt.Errorf("could not load beacon key file: %w", err)
 			}
 
-			rootEpoch := node.State.AtBlockID(node.RootBlock.ID()).Epochs().Current()
+			rootEpoch := node.State.AtBlockID(node.FinalizedRootBlock.ID()).Epochs().Current()
 			epochCounter, err := rootEpoch.Counter()
 			if err != nil {
 				return fmt.Errorf("could not get root epoch counter: %w", err)
@@ -371,17 +405,13 @@ func main() {
 			followerDistributor = pubsub.NewFollowerDistributor()
 			return nil
 		}).
-		Module("machine account config", func(node *cmd.NodeConfig) error {
-			machineAccountInfo, err = cmd.LoadNodeMachineAccountInfoFile(node.BootstrapDir, node.NodeID)
-			return err
-		}).
 		Module("sdk client connection options", func(node *cmd.NodeConfig) error {
 			anIDS, err := common.ValidateAccessNodeIDSFlag(accessNodeIDS, node.RootChainID, node.State.Sealed())
 			if err != nil {
 				return fmt.Errorf("failed to validate flag --access-node-ids %w", err)
 			}
 
-			flowClientConfigs, err = common.FlowClientConfigs(anIDS, insecureAccessAPI, node.State.Sealed())
+			flowClientConfigs, err = grpcclient.FlowClientConfigs(anIDS, insecureAccessAPI, node.State.Sealed())
 			if err != nil {
 				return fmt.Errorf("failed to prepare flow client connection configs for each access node id %w", err)
 			}
@@ -390,7 +420,7 @@ func main() {
 		}).
 		Component("machine account config validator", func(node *cmd.NodeConfig) (module.ReadyDoneAware, error) {
 			// @TODO use fallback logic for flowClient similar to DKG/QC contract clients
-			flowClient, err := common.FlowClient(flowClientConfigs[0])
+			flowClient, err := grpcclient.FlowClient(flowClientConfigs[0])
 			if err != nil {
 				return nil, fmt.Errorf("failed to get flow client connection option for access node (0): %s %w", flowClientConfigs[0].AccessAddress, err)
 			}
@@ -403,8 +433,9 @@ func main() {
 			validator, err := epochs.NewMachineAccountConfigValidator(
 				node.Logger,
 				flowClient,
-				flow.RoleCollection,
+				flow.RoleConsensus,
 				*machineAccountInfo,
+				machineAccountMetrics,
 				opts...,
 			)
 			return validator, err
@@ -420,7 +451,7 @@ func main() {
 				node.Metrics.Engine,
 				node.Metrics.Mempool,
 				sealingTracker,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				node.Storage.Headers,
 				node.Storage.Payloads,
@@ -443,11 +474,11 @@ func main() {
 			receiptRequester, err = requester.New(
 				node.Logger,
 				node.Metrics.Engine,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				node.State,
 				channels.RequestReceiptsByBlockID,
-				filter.HasRole(flow.RoleExecution),
+				filter.HasRole[flow.Identity](flow.RoleExecution),
 				func() flow.Entity { return &flow.ExecutionReceipt{} },
 				requester.WithRetryInitial(2*time.Second),
 				requester.WithRetryMaximum(30*time.Second),
@@ -474,7 +505,7 @@ func main() {
 
 			e, err := matching.NewEngine(
 				node.Logger,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				node.Metrics.Engine,
 				node.Metrics.Mempool,
@@ -507,7 +538,7 @@ func main() {
 			ing, err := ingestion.New(
 				node.Logger,
 				node.Metrics.Engine,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				core,
 			)
@@ -567,6 +598,8 @@ func main() {
 			)
 
 			notifier.AddParticipantConsumer(telemetryConsumer)
+			notifier.AddCommunicatorConsumer(telemetryConsumer)
+			notifier.AddFinalizationConsumer(telemetryConsumer)
 			notifier.AddFollowerConsumer(followerDistributor)
 
 			// initialize the persister
@@ -582,7 +615,7 @@ func main() {
 				node.Storage.Headers,
 				finalize,
 				notifier,
-				node.RootBlock.Header,
+				node.FinalizedRootBlock.Header,
 				node.RootQC,
 			)
 			if err != nil {
@@ -651,7 +684,50 @@ func main() {
 
 			return util.MergeReadyDone(voteAggregator, timeoutAggregator), nil
 		}).
+		Component("block rate cruise control", func(node *cmd.NodeConfig) (module.ReadyDoneAware, error) {
+			livenessData, err := hotstuffModules.Persist.GetLivenessData()
+			if err != nil {
+				return nil, err
+			}
+			ctl, err := cruisectl.NewBlockTimeController(node.Logger, metrics.NewCruiseCtlMetrics(), cruiseCtlConfig, node.State, livenessData.CurrentView)
+			if err != nil {
+				return nil, err
+			}
+			proposalDurProvider = ctl
+			hotstuffModules.Notifier.AddOnBlockIncorporatedConsumer(ctl.OnBlockIncorporated)
+			node.ProtocolEvents.AddConsumer(ctl)
+
+			// set up admin commands for dynamically updating configs
+			err = node.ConfigManager.RegisterBoolConfig("cruise-ctl-enabled", cruiseCtlConfig.GetEnabled, cruiseCtlConfig.SetEnabled)
+			if err != nil {
+				return nil, err
+			}
+			err = node.ConfigManager.RegisterDurationConfig("cruise-ctl-fallback-proposal-duration", cruiseCtlConfig.GetFallbackProposalDuration, cruiseCtlConfig.SetFallbackProposalDuration)
+			if err != nil {
+				return nil, err
+			}
+			err = node.ConfigManager.RegisterDurationConfig("cruise-ctl-min-view-duration", cruiseCtlConfig.GetMinViewDuration, cruiseCtlConfig.SetMinViewDuration)
+			if err != nil {
+				return nil, err
+			}
+			err = node.ConfigManager.RegisterDurationConfig("cruise-ctl-max-view-duration", cruiseCtlConfig.GetMaxViewDuration, cruiseCtlConfig.SetMaxViewDuration)
+			if err != nil {
+				return nil, err
+			}
+
+			return ctl, nil
+		}).
 		Component("consensus participant", func(node *cmd.NodeConfig) (module.ReadyDoneAware, error) {
+			mutableProtocolState := protocol_state.NewMutableProtocolState(
+				node.Logger,
+				node.Storage.EpochProtocolStateEntries,
+				node.Storage.ProtocolKVStore,
+				node.State.Params(),
+				node.Storage.Headers,
+				node.Storage.Results,
+				node.Storage.Setups,
+				node.Storage.EpochCommits,
+			)
 			// initialize the block builder
 			var build module.Builder
 			build, err = builder.NewBuilder(
@@ -664,6 +740,7 @@ func main() {
 				node.Storage.Blocks,
 				node.Storage.Results,
 				node.Storage.Receipts,
+				mutableProtocolState,
 				guarantees,
 				seals,
 				receipts,
@@ -681,8 +758,7 @@ func main() {
 				consensus.WithMinTimeout(hotstuffMinTimeout),
 				consensus.WithTimeoutAdjustmentFactor(hotstuffTimeoutAdjustmentFactor),
 				consensus.WithHappyPathMaxRoundFailures(hotstuffHappyPathMaxRoundFailures),
-				consensus.WithBlockRateDelay(blockRateDelay),
-				consensus.WithConfigRegistrar(node.ConfigManager),
+				consensus.WithProposalDurationProvider(proposalDurProvider),
 			}
 
 			if !startupTime.IsZero() {
@@ -697,6 +773,7 @@ func main() {
 			hot, err = consensus.NewParticipant(
 				createLogger(node.Logger, node.RootChainID),
 				mainMetrics,
+				node.Metrics.Mempool,
 				build,
 				finalizedBlock,
 				pending,
@@ -730,7 +807,7 @@ func main() {
 				hot,
 				hotstuffModules.VoteAggregator,
 				hotstuffModules.TimeoutAggregator,
-				modulecompliance.WithSkipNewProposalsThreshold(node.ComplianceConfig.SkipNewProposalsThreshold),
+				node.ComplianceConfig,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("could not initialize compliance core: %w", err)
@@ -753,7 +830,7 @@ func main() {
 			messageHub, err := message_hub.NewMessageHub(
 				createLogger(node.Logger, node.RootChainID),
 				node.Metrics.Engine,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				comp,
 				hot,
@@ -769,20 +846,27 @@ func main() {
 			return messageHub, nil
 		}).
 		Component("sync engine", func(node *cmd.NodeConfig) (module.ReadyDoneAware, error) {
+			spamConfig, err := synceng.NewSpamDetectionConfig()
+			if err != nil {
+				return nil, fmt.Errorf("could not initialize spam detection config: %w", err)
+			}
+
 			sync, err := synceng.New(
 				node.Logger,
 				node.Metrics.Engine,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				node.State,
 				node.Storage.Blocks,
 				comp,
 				syncCore,
 				node.SyncEngineIdentifierProvider,
+				spamConfig,
 			)
 			if err != nil {
 				return nil, fmt.Errorf("could not initialize synchronization engine: %w", err)
 			}
+			followerDistributor.AddFinalizationConsumer(sync)
 
 			return sync, nil
 		}).
@@ -800,7 +884,7 @@ func main() {
 			// exchange private DKG messages
 			messagingEngine, err := dkgeng.NewMessagingEngine(
 				node.Logger,
-				node.Network,
+				node.EngineRegistry,
 				node.Me,
 				dkgBrokerTunnel,
 				node.Metrics.Mempool,
@@ -836,7 +920,6 @@ func main() {
 					node.Me,
 					dkgContractClients,
 					dkgBrokerTunnel,
-					dkgControllerConfig,
 				),
 				viewsObserver,
 			)
@@ -851,7 +934,7 @@ func main() {
 	if err != nil {
 		nodeBuilder.Logger.Fatal().Err(err).Send()
 	}
-	node.Run()
+	node.Run(context.Background())
 }
 
 func loadBeaconPrivateKey(dir string, myID flow.Identifier) (*encodable.RandomBeaconPrivKey, error) {
@@ -873,10 +956,7 @@ func loadBeaconPrivateKey(dir string, myID flow.Identifier) (*encodable.RandomBe
 func createDKGContractClient(node *cmd.NodeConfig, machineAccountInfo *bootstrap.NodeMachineAccountInfo, flowClient *client.Client, anID flow.Identifier) (module.DKGContractClient, error) {
 	var dkgClient module.DKGContractClient
 
-	contracts, err := systemcontracts.SystemContractsForChain(node.RootChainID)
-	if err != nil {
-		return nil, err
-	}
+	contracts := systemcontracts.SystemContractsForChain(node.RootChainID)
 	dkgContractAddress := contracts.DKG.Address.Hex()
 
 	// construct signer from private key
@@ -905,11 +985,11 @@ func createDKGContractClient(node *cmd.NodeConfig, machineAccountInfo *bootstrap
 }
 
 // createDKGContractClients creates an array dkgContractClient that is sorted by retry fallback priority
-func createDKGContractClients(node *cmd.NodeConfig, machineAccountInfo *bootstrap.NodeMachineAccountInfo, flowClientOpts []*common.FlowClientConfig) ([]module.DKGContractClient, error) {
+func createDKGContractClients(node *cmd.NodeConfig, machineAccountInfo *bootstrap.NodeMachineAccountInfo, flowClientOpts []*grpcclient.FlowClientConfig) ([]module.DKGContractClient, error) {
 	dkgClients := make([]module.DKGContractClient, 0)
 
 	for _, opt := range flowClientOpts {
-		flowClient, err := common.FlowClient(opt)
+		flowClient, err := grpcclient.FlowClient(opt)
 		if err != nil {
 			return nil, fmt.Errorf("failed to create flow client for dkg contract client with options: %s %w", flowClientOpts, err)
 		}

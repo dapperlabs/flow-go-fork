@@ -3,7 +3,7 @@ package meter
 import (
 	"math"
 
-	"github.com/onflow/cadence/runtime/common"
+	"github.com/onflow/cadence/common"
 
 	"github.com/onflow/flow-go/fvm/errors"
 )
@@ -28,6 +28,15 @@ var (
 const MeterExecutionInternalPrecisionBytes = 16
 
 type ExecutionEffortWeights map[common.ComputationKind]uint64
+
+func (weights ExecutionEffortWeights) ComputationFromIntensities(intensities MeteredComputationIntensities) uint64 {
+	var result uint64
+	for kind, weight := range weights {
+		intensity := uint64(intensities[kind])
+		result += weight * intensity
+	}
+	return result >> MeterExecutionInternalPrecisionBytes
+}
 
 type ComputationMeterParameters struct {
 	computationLimit   uint64
@@ -94,6 +103,39 @@ func (m *ComputationMeter) MeterComputation(
 			uint64(m.params.TotalComputationLimit()))
 	}
 	return nil
+}
+
+// ComputationAvailable returns true if enough computation is left in the transaction for the given intensity and type
+func (m *ComputationMeter) ComputationAvailable(
+	kind common.ComputationKind,
+	intensity uint,
+) bool {
+	w, ok := m.params.computationWeights[kind]
+	// if not found return has capacity
+	// given the behaviour of MeterComputation is ignoring intensities without a set weight
+	if !ok {
+		return true
+	}
+
+	potentialComputationUsage := m.computationUsed + w*uint64(intensity)
+	return potentialComputationUsage <= m.params.computationLimit
+}
+
+// ComputationRemaining returns the remaining computation (intensity) left in the transaction for the given type
+func (m *ComputationMeter) ComputationRemaining(kind common.ComputationKind) uint {
+	w, ok := m.params.computationWeights[kind]
+	// if not found return has capacity
+	// given the behaviour of MeterComputation is ignoring intensities without a set weight
+	if !ok {
+		return math.MaxUint
+	}
+
+	remainingComputationUsage := m.params.computationLimit - m.computationUsed
+	if remainingComputationUsage <= 0 {
+		return 0
+	}
+
+	return uint(remainingComputationUsage / w)
 }
 
 // ComputationIntensities returns all the measured computational intensities

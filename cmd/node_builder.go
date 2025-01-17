@@ -2,18 +2,17 @@ package cmd
 
 import (
 	"context"
-	"os"
-	"path/filepath"
 	"time"
 
 	"github.com/dgraph-io/badger/v2"
 	madns "github.com/multiformats/go-multiaddr-dns"
+	"github.com/onflow/crypto"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/rs/zerolog"
 	"github.com/spf13/pflag"
 
 	"github.com/onflow/flow-go/admin/commands"
-	"github.com/onflow/flow-go/crypto"
+	"github.com/onflow/flow-go/config"
 	"github.com/onflow/flow-go/fvm"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module"
@@ -25,12 +24,6 @@ import (
 	"github.com/onflow/flow-go/network"
 	"github.com/onflow/flow-go/network/codec/cbor"
 	"github.com/onflow/flow-go/network/p2p"
-	"github.com/onflow/flow-go/network/p2p/connection"
-	"github.com/onflow/flow-go/network/p2p/distributor"
-	"github.com/onflow/flow-go/network/p2p/dns"
-	"github.com/onflow/flow-go/network/p2p/middleware"
-	"github.com/onflow/flow-go/network/p2p/p2pbuilder"
-	"github.com/onflow/flow-go/network/p2p/unicast"
 	"github.com/onflow/flow-go/state/protocol"
 	"github.com/onflow/flow-go/state/protocol/events"
 	bstorage "github.com/onflow/flow-go/storage/badger"
@@ -40,7 +33,10 @@ import (
 const NotSet = "not set"
 
 type BuilderFunc func(nodeConfig *NodeConfig) error
-type ReadyDoneFactory func(node *NodeConfig) (module.ReadyDoneAware, error)
+
+// ReadyDoneFactory is a function that returns a ReadyDoneAware component or an error if
+// the factory cannot create the component
+type ReadyDoneFactory[Input any] func(input Input) (module.ReadyDoneAware, error)
 
 // NodeBuilder declares the initialization methods needed to bootstrap up a Flow node
 type NodeBuilder interface {
@@ -80,7 +76,7 @@ type NodeBuilder interface {
 	// The ReadyDoneFactory may return either a `Component` or `ReadyDoneAware` instance.
 	// In both cases, the object is started according to its interface when the node is run,
 	// and the node will wait for the component to exit gracefully.
-	Component(name string, f ReadyDoneFactory) NodeBuilder
+	Component(name string, f ReadyDoneFactory[*NodeConfig]) NodeBuilder
 
 	// DependableComponent adds a new component to the node that conforms to the ReadyDoneAware
 	// interface. The builder will wait until all of the components in the dependencies list are ready
@@ -93,7 +89,7 @@ type NodeBuilder interface {
 	// IMPORTANT: Dependable components are started in parallel with no guaranteed run order, so all
 	// dependencies must be initialized outside of the ReadyDoneFactory, and their `Ready()` method
 	// MUST be idempotent.
-	DependableComponent(name string, f ReadyDoneFactory, dependencies *DependencyList) NodeBuilder
+	DependableComponent(name string, f ReadyDoneFactory[*NodeConfig], dependencies *DependencyList) NodeBuilder
 
 	// RestartableComponent adds a new component to the node that conforms to the ReadyDoneAware
 	// interface, and calls the provided error handler when an irrecoverable error is encountered.
@@ -101,7 +97,7 @@ type NodeBuilder interface {
 	// can/should be independently restarted when an irrecoverable error is encountered.
 	//
 	// Any irrecoverable errors thrown by the component will be passed to the provided error handler.
-	RestartableComponent(name string, f ReadyDoneFactory, errorHandler component.OnError) NodeBuilder
+	RestartableComponent(name string, f ReadyDoneFactory[*NodeConfig], errorHandler component.OnError) NodeBuilder
 
 	// ShutdownFunc adds a callback function that is called after all components have exited.
 	// All shutdown functions are called regardless of errors returned by previous callbacks. Any
@@ -140,7 +136,6 @@ type NodeBuilder interface {
 // For a node running as a standalone process, the config fields will be populated from the command line params,
 // while for a node running as a library, the config fields are expected to be initialized by the caller.
 type BaseConfig struct {
-	NetworkConfig
 	nodeIDHex                   string
 	AdminAddr                   string
 	AdminCert                   string
@@ -149,6 +144,7 @@ type BaseConfig struct {
 	AdminMaxMsgSize             uint
 	BindAddr                    string
 	NodeRole                    string
+	ObserverMode                bool
 	DynamicStartupANAddress     string
 	DynamicStartupANPubkey      string
 	DynamicStartupEpochPhase    string
@@ -176,45 +172,16 @@ type BaseConfig struct {
 	// ComplianceConfig configures either the compliance engine (consensus nodes)
 	// or the follower engine (all other node roles)
 	ComplianceConfig compliance.Config
-}
 
-type NetworkConfig struct {
-	// NetworkConnectionPruning determines whether connections to nodes
-	// that are not part of protocol state should be trimmed
-	// TODO: solely a fallback mechanism, can be removed upon reliable behavior in production.
-	NetworkConnectionPruning bool
-	// GossipSubConfig core gossipsub configuration.
-	GossipSubConfig *p2pbuilder.GossipSubConfig
-	// PreferredUnicastProtocols list of unicast protocols in preferred order
-	PreferredUnicastProtocols       []string
-	NetworkReceivedMessageCacheSize uint32
+	// FlowConfig Flow configuration.
+	FlowConfig config.FlowConfig
 
-	PeerUpdateInterval          time.Duration
-	UnicastMessageTimeout       time.Duration
-	DNSCacheTTL                 time.Duration
-	LibP2PResourceManagerConfig *p2pbuilder.ResourceManagerConfig
-	ConnectionManagerConfig     *connection.ManagerConfig
-	// UnicastCreateStreamRetryDelay initial delay used in the exponential backoff for create stream retries
-	UnicastCreateStreamRetryDelay time.Duration
-	// size of the queue for notifications about new peers in the disallow list.
-	DisallowListNotificationCacheSize uint32
-	// UnicastRateLimitersConfig configuration for all unicast rate limiters.
-	UnicastRateLimitersConfig *UnicastRateLimitersConfig
-}
+	// DhtSystemEnabled configures whether the DHT system is enabled on Access and Execution nodes.
+	DhtSystemEnabled bool
 
-// UnicastRateLimitersConfig unicast rate limiter configuration for the message and bandwidth rate limiters.
-type UnicastRateLimitersConfig struct {
-	// DryRun setting this to true will disable connection disconnects and gating when unicast rate limiters are configured
-	DryRun bool
-	// LockoutDuration the number of seconds a peer will be forced to wait before being allowed to successful reconnect to the node
-	// after being rate limited.
-	LockoutDuration time.Duration
-	// MessageRateLimit amount of unicast messages that can be sent by a peer per second.
-	MessageRateLimit int
-	// BandwidthRateLimit bandwidth size in bytes a peer is allowed to send via unicast streams per second.
-	BandwidthRateLimit int
-	// BandwidthBurstLimit bandwidth size in bytes a peer is allowed to send via unicast streams at once.
-	BandwidthBurstLimit int
+	// BitswapReprovideEnabled configures whether the Bitswap reprovide mechanism is enabled.
+	// This is only meaningful to Access and Execution nodes.
+	BitswapReprovideEnabled bool
 }
 
 // NodeConfig contains all the derived parameters such the NodeID, private keys etc. and initialized instances of
@@ -236,8 +203,8 @@ type NodeConfig struct {
 	ProtocolEvents    *events.Distributor
 	State             protocol.State
 	Resolver          madns.BasicResolver
-	Middleware        network.Middleware
-	Network           network.Network
+	EngineRegistry    network.EngineRegistry
+	NetworkUnderlay   network.Underlay
 	ConduitFactory    network.ConduitFactory
 	PingService       network.PingService
 	MsgValidators     []network.MessageValidator
@@ -248,7 +215,7 @@ type NodeConfig struct {
 	// list of dependencies for network peer manager startup
 	PeerManagerDependencies *DependencyList
 	// ReadyDoneAware implementation of the network middleware for DependableComponents
-	middlewareDependable *module.ProxiedReadyDoneAware
+	networkUnderlayDependable *module.ProxiedReadyDoneAware
 
 	// ID providers
 	IdentityProvider             module.IdentityProvider
@@ -265,51 +232,33 @@ type NodeConfig struct {
 
 	// UnicastRateLimiterDistributor notifies consumers when a peer's unicast message is rate limited.
 	UnicastRateLimiterDistributor p2p.UnicastRateLimiterDistributor
-	// NodeDisallowListDistributor notifies consumers of updates to disallow listing of nodes.
-	NodeDisallowListDistributor p2p.DisallowListNotificationDistributor
 }
 
 // StateExcerptAtBoot stores information about the root snapshot and latest finalized block for use in bootstrapping.
 type StateExcerptAtBoot struct {
 	// properties of RootSnapshot for convenience
-	RootBlock   *flow.Block
-	RootQC      *flow.QuorumCertificate
-	RootResult  *flow.ExecutionResult
-	RootSeal    *flow.Seal
-	RootChainID flow.ChainID
-	SporkID     flow.Identifier
-	// finalized block for use in bootstrapping
-	FinalizedHeader *flow.Header
+	// For node bootstrapped with a root snapshot for the first block of a spork,
+	// 		FinalizedRootBlock and SealedRootBlock are the same block (special case of self-sealing block)
+	// For node bootstrapped with a root snapshot for a block above the first block of a spork (dynamically bootstrapped),
+	// 		FinalizedRootBlock.Height > SealedRootBlock.Height
+	FinalizedRootBlock  *flow.Block             // The last finalized block when bootstrapped.
+	SealedRootBlock     *flow.Block             // The last sealed block when bootstrapped.
+	RootQC              *flow.QuorumCertificate // QC for Finalized Root Block
+	RootResult          *flow.ExecutionResult   // Result for SealedRootBlock
+	RootSeal            *flow.Seal              // Seal for RootResult
+	RootChainID         flow.ChainID
+	SporkID             flow.Identifier
+	LastFinalizedHeader *flow.Header // last finalized header when the node boots up
 }
 
 func DefaultBaseConfig() *BaseConfig {
-	homedir, _ := os.UserHomeDir()
-	datadir := filepath.Join(homedir, ".flow", "database")
+	datadir := "/data/protocol"
 
 	// NOTE: if the codec used in the network component is ever changed any code relying on
 	// the message format specific to the codec must be updated. i.e: the AuthorizedSenderValidator.
 	codecFactory := func() network.Codec { return cbor.NewCodec() }
 
 	return &BaseConfig{
-		NetworkConfig: NetworkConfig{
-			UnicastCreateStreamRetryDelay:   unicast.DefaultRetryDelay,
-			PeerUpdateInterval:              connection.DefaultPeerUpdateInterval,
-			UnicastMessageTimeout:           middleware.DefaultUnicastTimeout,
-			NetworkReceivedMessageCacheSize: p2p.DefaultReceiveCacheSize,
-			UnicastRateLimitersConfig: &UnicastRateLimitersConfig{
-				DryRun:              true,
-				LockoutDuration:     10,
-				MessageRateLimit:    0,
-				BandwidthRateLimit:  0,
-				BandwidthBurstLimit: middleware.LargeMsgMaxUnicastMsgSize,
-			},
-			GossipSubConfig:                   p2pbuilder.DefaultGossipSubConfig(),
-			DNSCacheTTL:                       dns.DefaultTimeToLive,
-			LibP2PResourceManagerConfig:       p2pbuilder.DefaultResourceManagerConfig(),
-			ConnectionManagerConfig:           connection.DefaultConnManagerConfig(),
-			NetworkConnectionPruning:          connection.PruningEnabled,
-			DisallowListNotificationCacheSize: distributor.DefaultDisallowListNotificationQueueCacheSize,
-		},
 		nodeIDHex:        NotSet,
 		AdminAddr:        NotSet,
 		AdminCert:        NotSet,
@@ -317,6 +266,7 @@ func DefaultBaseConfig() *BaseConfig {
 		AdminClientCAs:   NotSet,
 		AdminMaxMsgSize:  grpcutils.DefaultMaxMsgSize,
 		BindAddr:         NotSet,
+		ObserverMode:     false,
 		BootstrapDir:     "bootstrap",
 		datadir:          datadir,
 		secretsdir:       NotSet,
@@ -340,26 +290,28 @@ func DefaultBaseConfig() *BaseConfig {
 			Duration: 10 * time.Second,
 		},
 
-		HeroCacheMetricsEnable: false,
-		SyncCoreConfig:         chainsync.DefaultConfig(),
-		CodecFactory:           codecFactory,
-		ComplianceConfig:       compliance.DefaultConfig(),
+		HeroCacheMetricsEnable:  false,
+		SyncCoreConfig:          chainsync.DefaultConfig(),
+		CodecFactory:            codecFactory,
+		ComplianceConfig:        compliance.DefaultConfig(),
+		DhtSystemEnabled:        true,
+		BitswapReprovideEnabled: true,
 	}
 }
 
 // DependencyList is a slice of ReadyDoneAware implementations that are used by DependableComponent
 // to define the list of dependencies that must be ready before starting the component.
 type DependencyList struct {
-	components []module.ReadyDoneAware
+	Components []module.ReadyDoneAware
 }
 
 func NewDependencyList(components ...module.ReadyDoneAware) *DependencyList {
 	return &DependencyList{
-		components: components,
+		Components: components,
 	}
 }
 
 // Add adds a new ReadyDoneAware implementation to the list of dependencies.
 func (d *DependencyList) Add(component module.ReadyDoneAware) {
-	d.components = append(d.components, component)
+	d.Components = append(d.Components, component)
 }

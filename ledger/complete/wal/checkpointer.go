@@ -13,6 +13,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/docker/go-units"
 	"github.com/rs/zerolog"
 	"github.com/rs/zerolog/log"
 	"golang.org/x/sync/errgroup"
@@ -30,9 +31,12 @@ import (
 
 const checkpointFilenamePrefix = "checkpoint."
 
-const MagicBytesCheckpointHeader uint16 = 0x2137
-const MagicBytesCheckpointSubtrie uint16 = 0x2136
-const MagicBytesCheckpointToptrie uint16 = 0x2135
+const (
+	MagicBytesCheckpointHeader  uint16 = 0x2137
+	MagicBytesCheckpointSubtrie uint16 = 0x2136
+	MagicBytesCheckpointToptrie uint16 = 0x2135
+	MagicBytesPayloadHeader     uint16 = 0x2138
+)
 
 const VersionV1 uint16 = 0x01
 
@@ -246,13 +250,20 @@ func (c *Checkpointer) Checkpoint(to int) (err error) {
 
 	fileName := NumberToFilename(to)
 
-	err = StoreCheckpointV6SingleThread(tries, c.wal.dir, fileName, &c.wal.log)
+	err = StoreCheckpointV6SingleThread(tries, c.wal.dir, fileName, c.wal.log)
 
 	if err != nil {
 		return fmt.Errorf("could not create checkpoint for %v: %w", to, err)
 	}
 
-	c.wal.log.Info().Msgf("created checkpoint %d with %d tries", to, len(tries))
+	checkpointFileSize, err := ReadCheckpointFileSize(c.wal.dir, fileName)
+	if err != nil {
+		return fmt.Errorf("could not read checkpoint file size: %w", err)
+	}
+
+	c.wal.log.Info().
+		Str("checkpoint_file_size", units.BytesSize(float64(checkpointFileSize))).
+		Msgf("created checkpoint %d with %d tries", to, len(tries))
 
 	return nil
 }
@@ -267,7 +278,7 @@ func NumberToFilename(n int) string {
 }
 
 func (c *Checkpointer) CheckpointWriter(to int) (io.WriteCloser, error) {
-	return CreateCheckpointWriterForFile(c.dir, NumberToFilename(to), &c.wal.log)
+	return CreateCheckpointWriterForFile(c.dir, NumberToFilename(to), c.wal.log)
 }
 
 func (c *Checkpointer) Dir() string {
@@ -275,7 +286,7 @@ func (c *Checkpointer) Dir() string {
 }
 
 // CreateCheckpointWriterForFile returns a file writer that will write to a temporary file and then move it to the checkpoint folder by renaming it.
-func CreateCheckpointWriterForFile(dir, filename string, logger *zerolog.Logger) (io.WriteCloser, error) {
+func CreateCheckpointWriterForFile(dir, filename string, logger zerolog.Logger) (io.WriteCloser, error) {
 
 	fullname := path.Join(dir, filename)
 
@@ -312,7 +323,7 @@ func CreateCheckpointWriterForFile(dir, filename string, logger *zerolog.Logger)
 // as for each node, the children have been previously encountered.
 // TODO: evaluate alternatives to CRC32 since checkpoint file is many GB in size.
 // TODO: add concurrency if the performance gains are enough to offset complexity.
-func StoreCheckpointV5(dir string, fileName string, logger *zerolog.Logger, tries ...*trie.MTrie) (
+func StoreCheckpointV5(dir string, fileName string, logger zerolog.Logger, tries ...*trie.MTrie) (
 	// error
 	// Note, the above code, which didn't define the name "err" for the returned error, would be wrong,
 	// beause err needs to be defined in order to be updated by the defer function
@@ -428,7 +439,7 @@ func StoreCheckpointV5(dir string, fileName string, logger *zerolog.Logger, trie
 		// Index 0 is a special case with nil node.
 		traversedSubtrieNodes[nil] = 0
 
-		logging := logProgress(fmt.Sprintf("storing %v-th sub trie roots", i), estimatedSubtrieNodeCount, &log.Logger)
+		logging := logProgress(fmt.Sprintf("storing %v-th sub trie roots", i), estimatedSubtrieNodeCount, log.Logger)
 		for _, root := range subTrieRoot {
 			// Empty trie is always added to forest as starting point and
 			// empty trie's root is nil. It remains in the forest until evicted
@@ -516,10 +527,16 @@ func StoreCheckpointV5(dir string, fileName string, logger *zerolog.Logger, trie
 	return nil
 }
 
-func logProgress(msg string, estimatedSubtrieNodeCount int, logger *zerolog.Logger) func(nodeCounter uint64) {
-	lg := util.LogProgress(msg, estimatedSubtrieNodeCount, logger)
+func logProgress(msg string, estimatedSubtrieNodeCount int, logger zerolog.Logger) func(nodeCounter uint64) {
+	lg := util.LogProgress(
+		logger,
+		util.DefaultLogProgressConfig(
+			msg,
+			estimatedSubtrieNodeCount,
+		),
+	)
 	return func(index uint64) {
-		lg(int(index))
+		lg(1)
 	}
 }
 
@@ -601,12 +618,12 @@ func getNodesAtLevel(root *node.Node, level uint) []*node.Node {
 
 func (c *Checkpointer) LoadCheckpoint(checkpoint int) ([]*trie.MTrie, error) {
 	filepath := path.Join(c.dir, NumberToFilename(checkpoint))
-	return LoadCheckpoint(filepath, &c.wal.log)
+	return LoadCheckpoint(filepath, c.wal.log)
 }
 
 func (c *Checkpointer) LoadRootCheckpoint() ([]*trie.MTrie, error) {
 	filepath := path.Join(c.dir, bootstrap.FilenameWALRootCheckpoint)
-	return LoadCheckpoint(filepath, &c.wal.log)
+	return LoadCheckpoint(filepath, c.wal.log)
 }
 
 func (c *Checkpointer) HasRootCheckpoint() (bool, error) {
@@ -628,7 +645,7 @@ func (c *Checkpointer) RemoveCheckpoint(checkpoint int) error {
 	return deleteCheckpointFiles(c.dir, name)
 }
 
-func LoadCheckpoint(filepath string, logger *zerolog.Logger) (
+func LoadCheckpoint(filepath string, logger zerolog.Logger) (
 	tries []*trie.MTrie,
 	errToReturn error) {
 	file, err := os.Open(filepath)
@@ -648,7 +665,7 @@ func LoadCheckpoint(filepath string, logger *zerolog.Logger) (
 	return readCheckpoint(file, logger)
 }
 
-func readCheckpoint(f *os.File, logger *zerolog.Logger) ([]*trie.MTrie, error) {
+func readCheckpoint(f *os.File, logger zerolog.Logger) ([]*trie.MTrie, error) {
 
 	// Read header: magic (2 bytes) + version (2 bytes)
 	header := make([]byte, headerSize)
@@ -888,7 +905,7 @@ func readCheckpointV4(f *os.File) ([]*trie.MTrie, error) {
 
 // readCheckpointV5 decodes checkpoint file (version 5) and returns a list of tries.
 // Checkpoint file header (magic and version) are verified by the caller.
-func readCheckpointV5(f *os.File, logger *zerolog.Logger) ([]*trie.MTrie, error) {
+func readCheckpointV5(f *os.File, logger zerolog.Logger) ([]*trie.MTrie, error) {
 	logger.Info().Msgf("reading v5 checkpoint file")
 
 	// Scratch buffer is used as temporary buffer that reader can read into.
@@ -1006,7 +1023,7 @@ func readCheckpointV5(f *os.File, logger *zerolog.Logger) ([]*trie.MTrie, error)
 // causes two checkpoint files to be cached for each checkpointing, eventually
 // caching hundreds of GB.
 // CAUTION: no-op when GOOS != linux.
-func evictFileFromLinuxPageCache(f *os.File, fsync bool, logger *zerolog.Logger) error {
+func evictFileFromLinuxPageCache(f *os.File, fsync bool, logger zerolog.Logger) error {
 	err := fadviseNoLinuxPageCache(f.Fd(), fsync)
 	if err != nil {
 		return err
@@ -1030,7 +1047,7 @@ func CopyCheckpointFile(filename string, from string, to string) (
 	[]string,
 	error,
 ) {
-	// It's possible that the trie dir does not yet exist. If not this will create the the required path
+	// It's possible that the trie dir does not yet exist. If not this will create the required path
 	err := os.MkdirAll(to, 0700)
 	if err != nil {
 		return nil, err
@@ -1065,6 +1082,38 @@ func CopyCheckpointFile(filename string, from string, to string) (
 	err = group.Wait()
 	if err != nil {
 		return nil, fmt.Errorf("fail to copy checkpoint files: %w", err)
+	}
+
+	return newPaths, nil
+}
+
+// SoftlinkCheckpointFile creates soft links of the checkpoint file including the part files from the given `from` to
+// the `to` directory
+func SoftlinkCheckpointFile(filename string, from string, to string) ([]string, error) {
+
+	// It's possible that the trie dir does not yet exist. If not this will create the required path
+	err := os.MkdirAll(to, 0700)
+	if err != nil {
+		return nil, err
+	}
+
+	// checkpoint V6 produces multiple checkpoint part files that need to be copied over
+	pattern := filePathPattern(from, filename)
+	matched, err := filepath.Glob(pattern)
+	if err != nil {
+		return nil, fmt.Errorf("could not glob checkpoint file with pattern %v: %w", pattern, err)
+	}
+
+	newPaths := make([]string, len(matched))
+	for i, match := range matched {
+		_, partfile := filepath.Split(match)
+		newPath := filepath.Join(to, partfile)
+		newPaths[i] = newPath
+
+		err := os.Symlink(match, newPath)
+		if err != nil {
+			return nil, fmt.Errorf("cannot link file from %v to %v: %w", match, newPath, err)
+		}
 	}
 
 	return newPaths, nil

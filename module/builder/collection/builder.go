@@ -43,9 +43,8 @@ type Builder struct {
 	log            zerolog.Logger
 	clusterEpoch   uint64 // the operating epoch for this cluster
 	// cache of values about the operating epoch which never change
-	refEpochFirstHeight uint64           // first height of this cluster's operating epoch
-	epochFinalHeight    *uint64          // last height of this cluster's operating epoch (nil if epoch not ended)
-	epochFinalID        *flow.Identifier // ID of last block in this cluster's operating epoch (nil if epoch not ended)
+	epochFinalHeight *uint64          // last height of this cluster's operating epoch (nil if epoch not ended)
+	epochFinalID     *flow.Identifier // ID of last block in this cluster's operating epoch (nil if epoch not ended)
 }
 
 func NewBuilder(
@@ -75,11 +74,6 @@ func NewBuilder(
 		clusterEpoch:   epochCounter,
 	}
 
-	err := db.View(operation.RetrieveEpochFirstHeight(epochCounter, &b.refEpochFirstHeight))
-	if err != nil {
-		return nil, fmt.Errorf("could not get epoch first height: %w", err)
-	}
-
 	for _, apply := range opts {
 		apply(&b.config)
 	}
@@ -94,7 +88,7 @@ func NewBuilder(
 
 // BuildOn creates a new block built on the given parent. It produces a payload
 // that is valid with respect to the un-finalized chain it extends.
-func (b *Builder) BuildOn(parentID flow.Identifier, setter func(*flow.Header) error) (*flow.Header, error) {
+func (b *Builder) BuildOn(parentID flow.Identifier, setter func(*flow.Header) error, sign func(*flow.Header) error) (*flow.Header, error) {
 	parentSpan, ctx := b.tracer.StartSpanFromContext(context.Background(), trace.COLBuildOn)
 	defer parentSpan.End()
 
@@ -180,7 +174,7 @@ func (b *Builder) BuildOn(parentID flow.Identifier, setter func(*flow.Header) er
 	// STEP 3: we have a set of transactions that are valid to include on this fork.
 	// Now we create the header for the cluster block.
 	span, _ = b.tracer.StartSpanFromContext(ctx, trace.COLBuildOnCreateHeader)
-	header, err := b.buildHeader(buildCtx, payload, setter)
+	header, err := b.buildHeader(buildCtx, payload, setter, sign)
 	span.End()
 	if err != nil {
 		return nil, fmt.Errorf("could not build header: %w", err)
@@ -487,7 +481,12 @@ func (b *Builder) buildPayload(buildCtx *blockBuildContext) (*cluster.Payload, e
 // buildHeader constructs the header for the cluster block being built.
 // It invokes the HotStuff setter to set fields related to HotStuff (QC, etc.).
 // No errors are expected during normal operation.
-func (b *Builder) buildHeader(ctx *blockBuildContext, payload *cluster.Payload, setter func(header *flow.Header) error) (*flow.Header, error) {
+func (b *Builder) buildHeader(
+	ctx *blockBuildContext,
+	payload *cluster.Payload,
+	setter func(header *flow.Header) error,
+	sign func(*flow.Header) error,
+) (*flow.Header, error) {
 
 	header := &flow.Header{
 		ChainID:     ctx.parent.ChainID,
@@ -504,6 +503,10 @@ func (b *Builder) buildHeader(ctx *blockBuildContext, payload *cluster.Payload, 
 	err := setter(header)
 	if err != nil {
 		return nil, fmt.Errorf("could not set fields to header: %w", err)
+	}
+	err = sign(header)
+	if err != nil {
+		return nil, fmt.Errorf("could not sign proposal: %w", err)
 	}
 	return header, nil
 }

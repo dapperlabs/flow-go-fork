@@ -77,6 +77,11 @@ type TableTransaction[TKey comparable, TVal any] struct {
 	// When isSnapshotReadTransaction is true, invalidators must be empty.
 	isSnapshotReadTransaction bool
 	invalidators              chainedTableInvalidators[TKey, TVal]
+
+	// ignoreLatestCommitExecutionTime is used to bypass latestCommitExecutionTime checks during
+	// commit. This is used when operating in caching mode with scripts since "commits" are all done
+	// at the end of the block and are not expected to progress the execution time.
+	ignoreLatestCommitExecutionTime bool
 }
 
 func NewEmptyTable[
@@ -198,25 +203,55 @@ func (table *DerivedDataTable[TKey, TVal]) unsafeValidate(
 
 	applicable := table.invalidators.ApplicableInvalidators(
 		txn.toValidateTime)
-	if applicable.ShouldInvalidateEntries() {
-		for key, entry := range txn.writeSet {
-			if applicable.ShouldInvalidateEntry(
+	shouldInvalidateEntries := applicable.ShouldInvalidateEntries()
+
+	for key, entry := range txn.writeSet {
+		current, ok := table.items[key]
+		if ok && current != entry {
+			// The derived data table must always return the same item for a given key,
+			// otherwise the cadence runtime will have issues comparing resolved cadence types.
+			//
+			// for example:
+			// two transactions are run concurrently, first loads (cadence contracts)
+			// A and B where B depends on A. The second transaction also loads A and C,
+			// where C depends on A. The first transaction commits first.
+			// The A from the second transaction is equivalent to the A from
+			// the first transaction but it is not the same object.
+			//
+			// Overwriting A with the A from the second transaction will cause program B
+			// to break because it will not know the types from A returned from
+			// the cache in the future.
+			// Not overwriting A will cause program C to break because it will not know
+			// the types from A returned from the cache in the future.
+			//
+			// The solution is to treat this as a conflict and retry the transaction.
+			// When the transaction is retried, the A from the first transaction will
+			// be used to load C in the second transaction.
+
+			return errors.NewRetryableConflictError(
+				"invalid TableTransaction: write conflict")
+		}
+
+		if !shouldInvalidateEntries ||
+			!applicable.ShouldInvalidateEntry(
 				key,
 				entry.Value,
-				entry.ExecutionSnapshot) {
-
-				if txn.snapshotTime == txn.executionTime {
-					// This should never happen since the transaction is
-					// sequentially executed.
-					return fmt.Errorf(
-						"invalid TableTransaction: unrecoverable outdated " +
-							"write set")
-				}
-
-				return errors.NewRetryableConflictError(
-					"invalid TableTransaction: outdated write set")
-			}
+				entry.ExecutionSnapshot,
+			) {
+			continue
 		}
+
+		if txn.snapshotTime == txn.executionTime {
+			// This should never happen since the transaction is
+			// sequentially executed.
+			return fmt.Errorf(
+				"invalid TableTransaction: unrecoverable outdated " +
+					"write set")
+		}
+
+		return errors.NewRetryableConflictError(
+			"invalid TableTransaction: outdated write set")
+
 	}
 
 	txn.toValidateTime = table.latestCommitExecutionTime + 1
@@ -240,6 +275,7 @@ func (table *DerivedDataTable[TKey, TVal]) commit(
 	defer table.lock.Unlock()
 
 	if !txn.isSnapshotReadTransaction &&
+		!txn.ignoreLatestCommitExecutionTime &&
 		table.latestCommitExecutionTime+1 < txn.snapshotTime {
 
 		return fmt.Errorf(
@@ -298,15 +334,17 @@ func (table *DerivedDataTable[TKey, TVal]) newTableTransaction(
 	snapshotTime logical.Time,
 	executionTime logical.Time,
 	isSnapshotReadTransaction bool,
+	ignoreLatestCommitExecutionTime bool,
 ) *TableTransaction[TKey, TVal] {
 	return &TableTransaction[TKey, TVal]{
-		table:                     table,
-		snapshotTime:              snapshotTime,
-		executionTime:             executionTime,
-		toValidateTime:            snapshotTime,
-		readSet:                   map[TKey]*invalidatableEntry[TVal]{},
-		writeSet:                  map[TKey]*invalidatableEntry[TVal]{},
-		isSnapshotReadTransaction: isSnapshotReadTransaction,
+		table:                           table,
+		snapshotTime:                    snapshotTime,
+		executionTime:                   executionTime,
+		toValidateTime:                  snapshotTime,
+		readSet:                         map[TKey]*invalidatableEntry[TVal]{},
+		writeSet:                        map[TKey]*invalidatableEntry[TVal]{},
+		isSnapshotReadTransaction:       isSnapshotReadTransaction,
+		ignoreLatestCommitExecutionTime: ignoreLatestCommitExecutionTime,
 	}
 }
 
@@ -314,6 +352,15 @@ func (table *DerivedDataTable[TKey, TVal]) NewSnapshotReadTableTransaction() *Ta
 	return table.newTableTransaction(
 		logical.EndOfBlockExecutionTime,
 		logical.EndOfBlockExecutionTime,
+		true,
+		false)
+}
+
+func (table *DerivedDataTable[TKey, TVal]) NewCachingSnapshotReadTableTransaction() *TableTransaction[TKey, TVal] {
+	return table.newTableTransaction(
+		logical.EndOfBlockExecutionTime,
+		logical.EndOfBlockExecutionTime,
+		false,
 		true)
 }
 
@@ -342,6 +389,7 @@ func (table *DerivedDataTable[TKey, TVal]) NewTableTransaction(
 	return table.newTableTransaction(
 		snapshotTime,
 		executionTime,
+		false,
 		false), nil
 }
 
@@ -419,23 +467,44 @@ func (txn *TableTransaction[TKey, TVal]) GetOrCompute(
 	TVal,
 	error,
 ) {
+	val, _, err := txn.GetWithStateOrCompute(txnState, key, computer)
+	return val, err
+}
+
+// GetWithStateOrCompute returns the key's value and the execution snapshot used to
+// compute it. If a pre-computed value is available,
+// then the pre-computed value is returned and the cached state is replayed on
+// txnState.  Otherwise, the value is computed using valFunc; both the value
+// and the states used to compute the value are captured.
+//
+// Note: valFunc must be an idempotent function and it must not modify
+// txnState's values.
+func (txn *TableTransaction[TKey, TVal]) GetWithStateOrCompute(
+	txnState state.NestedTransactionPreparer,
+	key TKey,
+	computer ValueComputer[TKey, TVal],
+) (
+	TVal,
+	*snapshot.ExecutionSnapshot,
+	error,
+) {
 	var defaultVal TVal
 
 	val, state, ok := txn.get(key)
 	if ok {
 		err := txnState.AttachAndCommitNestedTransaction(state)
 		if err != nil {
-			return defaultVal, fmt.Errorf(
+			return defaultVal, nil, fmt.Errorf(
 				"failed to replay cached state: %w",
 				err)
 		}
 
-		return val, nil
+		return val, state, nil
 	}
 
 	nestedTxId, err := txnState.BeginNestedTransaction()
 	if err != nil {
-		return defaultVal, fmt.Errorf("failed to start nested txn: %w", err)
+		return defaultVal, nil, fmt.Errorf("failed to start nested txn: %w", err)
 	}
 
 	val, err = computer.Compute(txnState, key)
@@ -449,12 +518,12 @@ func (txn *TableTransaction[TKey, TVal]) GetOrCompute(
 	}
 
 	if err != nil {
-		return defaultVal, fmt.Errorf("failed to derive value: %w", err)
+		return defaultVal, nil, fmt.Errorf("failed to derive value: %w", err)
 	}
 
 	txn.set(key, val, committedState)
 
-	return val, nil
+	return val, committedState, nil
 }
 
 func (txn *TableTransaction[TKey, TVal]) AddInvalidator(

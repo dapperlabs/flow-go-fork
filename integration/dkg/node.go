@@ -8,6 +8,7 @@ import (
 
 	sdk "github.com/onflow/flow-go-sdk"
 	sdkcrypto "github.com/onflow/flow-go-sdk/crypto"
+
 	"github.com/onflow/flow-go/engine/consensus/dkg"
 	testmock "github.com/onflow/flow-go/engine/testutil/mock"
 	"github.com/onflow/flow-go/model/bootstrap"
@@ -19,7 +20,7 @@ import (
 )
 
 type nodeAccount struct {
-	netID          *flow.Identity
+	netID          bootstrap.NodeInfo
 	privKey        crypto.PrivateKey
 	accountKey     *sdk.AccountKey
 	accountID      string
@@ -77,7 +78,7 @@ func (n *node) setEpochs(t *testing.T, currentSetup flow.EpochSetup, nextSetup f
 	nextEpoch.On("Counter").Return(nextSetup.Counter, nil)
 	nextEpoch.On("InitialIdentities").Return(nextSetup.Participants, nil)
 	nextEpoch.On("RandomSource").Return(nextSetup.RandomSource, nil)
-	nextEpoch.On("DKG").Return(nil, nil) // no error means didn't run into EECC
+	nextEpoch.On("DKG").Return(nil, nil) // no error means didn't run into EFM
 	nextEpoch.On("FirstView").Return(nextSetup.FirstView, nil)
 	nextEpoch.On("FinalView").Return(nextSetup.FinalView, nil)
 
@@ -86,7 +87,7 @@ func (n *node) setEpochs(t *testing.T, currentSetup flow.EpochSetup, nextSetup f
 	epochQuery.Add(nextEpoch)
 	snapshot := new(protocolmock.Snapshot)
 	snapshot.On("Epochs").Return(epochQuery)
-	snapshot.On("Phase").Return(flow.EpochPhaseStaking, nil)
+	snapshot.On("EpochPhase").Return(flow.EpochPhaseStaking, nil)
 	snapshot.On("Head").Return(firstBlock, nil)
 	state := new(protocolmock.ParticipantState)
 	state.On("AtBlockID", firstBlock.ID()).Return(snapshot)

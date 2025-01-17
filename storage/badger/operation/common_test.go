@@ -1,14 +1,10 @@
-// (c) 2019 Dapper Labs - ALL RIGHTS RESERVED
-
 package operation
 
 import (
 	"bytes"
 	"fmt"
-	"math/rand"
 	"reflect"
 	"testing"
-	"time"
 
 	"github.com/dgraph-io/badger/v2"
 	"github.com/stretchr/testify/assert"
@@ -19,10 +15,6 @@ import (
 	"github.com/onflow/flow-go/storage"
 	"github.com/onflow/flow-go/utils/unittest"
 )
-
-func init() {
-	rand.Seed(time.Now().UnixNano())
-}
 
 type Entity struct {
 	ID uint64

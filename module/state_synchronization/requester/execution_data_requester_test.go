@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"math/rand"
-	"os"
 	"sync"
 	"testing"
 	"time"
@@ -12,7 +11,6 @@ import (
 	"github.com/dgraph-io/badger/v2"
 	"github.com/ipfs/go-datastore"
 	dssync "github.com/ipfs/go-datastore/sync"
-	"github.com/rs/zerolog"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/mock"
 	"github.com/stretchr/testify/require"
@@ -20,12 +18,15 @@ import (
 
 	"github.com/onflow/flow-go/consensus/hotstuff/model"
 	"github.com/onflow/flow-go/consensus/hotstuff/notifications/pubsub"
+	"github.com/onflow/flow-go/engine/access/subscription"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module"
 	"github.com/onflow/flow-go/module/blobs"
 	"github.com/onflow/flow-go/module/executiondatasync/execution_data"
+	"github.com/onflow/flow-go/module/executiondatasync/execution_data/cache"
 	exedatamock "github.com/onflow/flow-go/module/executiondatasync/execution_data/mock"
 	"github.com/onflow/flow-go/module/irrecoverable"
+	"github.com/onflow/flow-go/module/mempool/herocache"
 	"github.com/onflow/flow-go/module/metrics"
 	"github.com/onflow/flow-go/module/state_synchronization"
 	"github.com/onflow/flow-go/module/state_synchronization/requester"
@@ -39,10 +40,11 @@ import (
 type ExecutionDataRequesterSuite struct {
 	suite.Suite
 
-	blobstore  blobs.Blobstore
-	datastore  datastore.Batching
-	db         *badger.DB
-	downloader *exedatamock.Downloader
+	blobstore   blobs.Blobstore
+	datastore   datastore.Batching
+	db          *badger.DB
+	downloader  *exedatamock.Downloader
+	distributor *requester.ExecutionDataDistributor
 
 	run edTestRun
 
@@ -51,7 +53,6 @@ type ExecutionDataRequesterSuite struct {
 
 func TestExecutionDataRequesterSuite(t *testing.T) {
 	t.Parallel()
-	rand.Seed(time.Now().UnixMilli())
 	suite.Run(t, new(ExecutionDataRequesterSuite))
 }
 
@@ -112,7 +113,7 @@ func mockDownloader(edStore map[flow.Identifier]*testExecutionDataServiceEntry) 
 		return ed.ExecutionData, nil
 	}
 
-	downloader.On("Download", mock.Anything, mock.AnythingOfType("flow.Identifier")).
+	downloader.On("Get", mock.Anything, mock.AnythingOfType("flow.Identifier")).
 		Return(
 			func(ctx context.Context, id flow.Identifier) *execution_data.BlockExecutionData {
 				ed, _ := get(id)
@@ -275,8 +276,10 @@ func (suite *ExecutionDataRequesterSuite) TestRequesterPausesAndResumes() {
 		testData.maxSearchAhead = maxSearchAhead
 		testData.waitTimeout = time.Second * 10
 
-		// calculate the expected number of blocks that should be downloaded before resuming
-		expectedDownloads := maxSearchAhead + (pauseHeight-1)*2
+		// calculate the expected number of blocks that should be downloaded before resuming.
+		// the test should download all blocks up to pauseHeight, then maxSearchAhead blocks beyond.
+		// the pause block itself is excluded.
+		expectedDownloads := pauseHeight + maxSearchAhead - 1
 
 		edr, fd := suite.prepareRequesterTest(testData)
 		fetchedExecutionData := suite.runRequesterTestPauseResume(edr, fd, testData, int(expectedDownloads), resume)
@@ -386,9 +389,13 @@ func generatePauseResume(pauseHeight uint64) (specialBlockGenerator, func()) {
 }
 
 func (suite *ExecutionDataRequesterSuite) prepareRequesterTest(cfg *fetchTestRun) (state_synchronization.ExecutionDataRequester, *pubsub.FollowerDistributor) {
+	logger := unittest.Logger()
+	metrics := metrics.NewNoopCollector()
+
 	headers := synctest.MockBlockHeaderStorage(
 		synctest.WithByID(cfg.blocksByID),
 		synctest.WithByHeight(cfg.blocksByHeight),
+		synctest.WithBlockIDByHeight(cfg.blocksByHeight),
 	)
 	results := synctest.MockResultsStorage(
 		synctest.WithResultByID(cfg.resultsByID),
@@ -399,21 +406,24 @@ func (suite *ExecutionDataRequesterSuite) prepareRequesterTest(cfg *fetchTestRun
 	state := suite.mockProtocolState(cfg.blocksByHeight)
 
 	suite.downloader = mockDownloader(cfg.executionDataEntries)
+	suite.distributor = requester.NewExecutionDataDistributor()
+
+	heroCache := herocache.NewBlockExecutionData(subscription.DefaultCacheSize, logger, metrics)
+	cache := cache.NewExecutionDataCache(suite.downloader, headers, seals, results, heroCache)
 
 	followerDistributor := pubsub.NewFollowerDistributor()
 	processedHeight := bstorage.NewConsumerProgress(suite.db, module.ConsumeProgressExecutionDataRequesterBlockHeight)
 	processedNotification := bstorage.NewConsumerProgress(suite.db, module.ConsumeProgressExecutionDataRequesterNotification)
 
-	edr := requester.New(
-		zerolog.New(os.Stdout).With().Timestamp().Logger(),
-		metrics.NewNoopCollector(),
+	edr, err := requester.New(
+		logger,
+		metrics,
 		suite.downloader,
+		cache,
 		processedHeight,
 		processedNotification,
 		state,
 		headers,
-		results,
-		seals,
 		requester.ExecutionDataConfig{
 			InitialBlockHeight: cfg.startHeight - 1,
 			MaxSearchAhead:     cfg.maxSearchAhead,
@@ -421,7 +431,9 @@ func (suite *ExecutionDataRequesterSuite) prepareRequesterTest(cfg *fetchTestRun
 			RetryDelay:         cfg.retryDelay,
 			MaxRetryDelay:      cfg.maxRetryDelay,
 		},
+		suite.distributor,
 	)
+	require.NoError(suite.T(), err)
 
 	followerDistributor.AddOnBlockFinalizedConsumer(edr.OnBlockFinalized)
 
@@ -439,7 +451,7 @@ func (suite *ExecutionDataRequesterSuite) runRequesterTestHalts(edr state_synchr
 	fetchedExecutionData := cfg.FetchedExecutionData()
 
 	// collect all execution data notifications
-	edr.AddOnExecutionDataReceivedConsumer(suite.consumeExecutionDataNotifications(cfg, func() { close(testDone) }, fetchedExecutionData))
+	suite.distributor.AddOnExecutionDataReceivedConsumer(suite.consumeExecutionDataNotifications(cfg, func() { close(testDone) }, fetchedExecutionData))
 
 	edr.Start(signalerCtx)
 	unittest.RequireCloseBefore(suite.T(), edr.Ready(), cfg.waitTimeout, "timed out waiting for requester to be ready")
@@ -466,7 +478,7 @@ func (suite *ExecutionDataRequesterSuite) runRequesterTestPauseResume(edr state_
 	fetchedExecutionData := cfg.FetchedExecutionData()
 
 	// collect all execution data notifications
-	edr.AddOnExecutionDataReceivedConsumer(suite.consumeExecutionDataNotifications(cfg, func() { close(testDone) }, fetchedExecutionData))
+	suite.distributor.AddOnExecutionDataReceivedConsumer(suite.consumeExecutionDataNotifications(cfg, func() { close(testDone) }, fetchedExecutionData))
 
 	edr.Start(signalerCtx)
 	unittest.RequireCloseBefore(suite.T(), edr.Ready(), cfg.waitTimeout, "timed out waiting for requester to be ready")
@@ -478,7 +490,7 @@ func (suite *ExecutionDataRequesterSuite) runRequesterTestPauseResume(edr state_
 	unittest.RequireNeverClosedWithin(suite.T(), testDone, 500*time.Millisecond, "finished unexpectedly")
 
 	// confirm the expected number of downloads were attempted
-	suite.downloader.AssertNumberOfCalls(suite.T(), "Download", expectedDownloads)
+	suite.downloader.AssertNumberOfCalls(suite.T(), "Get", expectedDownloads)
 
 	suite.T().Log("Resuming")
 	resume()
@@ -504,7 +516,7 @@ func (suite *ExecutionDataRequesterSuite) runRequesterTest(edr state_synchroniza
 	fetchedExecutionData := cfg.FetchedExecutionData()
 
 	// collect all execution data notifications
-	edr.AddOnExecutionDataReceivedConsumer(suite.consumeExecutionDataNotifications(cfg, func() { close(testDone) }, fetchedExecutionData))
+	suite.distributor.AddOnExecutionDataReceivedConsumer(suite.consumeExecutionDataNotifications(cfg, func() { close(testDone) }, fetchedExecutionData))
 
 	edr.Start(signalerCtx)
 	unittest.RequireCloseBefore(suite.T(), edr.Ready(), cfg.waitTimeout, "timed out waiting for requester to be ready")
@@ -530,6 +542,11 @@ func (suite *ExecutionDataRequesterSuite) consumeExecutionDataNotifications(cfg 
 		}
 
 		fetchedExecutionData[ed.BlockID] = ed.BlockExecutionData
+		if _, ok := cfg.blocksByID[ed.BlockID]; !ok {
+			suite.T().Errorf("unknown execution data for block %s", ed.BlockID)
+			return
+		}
+
 		suite.T().Logf("notified of execution data for block %v height %d (%d/%d)", ed.BlockID, cfg.blocksByID[ed.BlockID].Header.Height, len(fetchedExecutionData), cfg.sealedCount)
 
 		if cfg.IsLastSeal(ed.BlockID) {
@@ -658,7 +675,7 @@ func (suite *ExecutionDataRequesterSuite) generateTestData(blockCount int, speci
 
 		ed := unittest.BlockExecutionDataFixture(unittest.WithBlockExecutionDataBlockID(block.ID()))
 
-		cid, err := eds.AddExecutionData(context.Background(), ed)
+		cid, err := eds.Add(context.Background(), ed)
 		require.NoError(suite.T(), err)
 
 		result := buildResult(block, cid, previousResult)
@@ -753,6 +770,8 @@ type mockSnapshot struct {
 	mu     sync.Mutex
 }
 
+var _ protocol.Snapshot = &mockSnapshot{}
+
 func (m *mockSnapshot) set(header *flow.Header, err error) {
 	m.mu.Lock()
 	defer m.mu.Unlock()
@@ -770,17 +789,20 @@ func (m *mockSnapshot) Head() (*flow.Header, error) {
 
 // none of these are used in this test
 func (m *mockSnapshot) QuorumCertificate() (*flow.QuorumCertificate, error) { return nil, nil }
-func (m *mockSnapshot) Identities(selector flow.IdentityFilter) (flow.IdentityList, error) {
+func (m *mockSnapshot) Identities(selector flow.IdentityFilter[flow.Identity]) (flow.IdentityList, error) {
 	return nil, nil
 }
 func (m *mockSnapshot) Identity(nodeID flow.Identifier) (*flow.Identity, error) { return nil, nil }
 func (m *mockSnapshot) SealedResult() (*flow.ExecutionResult, *flow.Seal, error) {
 	return nil, nil, nil
 }
-func (m *mockSnapshot) Commit() (flow.StateCommitment, error)         { return flow.DummyStateCommitment, nil }
-func (m *mockSnapshot) SealingSegment() (*flow.SealingSegment, error) { return nil, nil }
-func (m *mockSnapshot) Descendants() ([]flow.Identifier, error)       { return nil, nil }
-func (m *mockSnapshot) RandomSource() ([]byte, error)                 { return nil, nil }
-func (m *mockSnapshot) Phase() (flow.EpochPhase, error)               { return flow.EpochPhaseUndefined, nil }
-func (m *mockSnapshot) Epochs() protocol.EpochQuery                   { return nil }
-func (m *mockSnapshot) Params() protocol.GlobalParams                 { return nil }
+func (m *mockSnapshot) Commit() (flow.StateCommitment, error)                    { return flow.DummyStateCommitment, nil }
+func (m *mockSnapshot) SealingSegment() (*flow.SealingSegment, error)            { return nil, nil }
+func (m *mockSnapshot) Descendants() ([]flow.Identifier, error)                  { return nil, nil }
+func (m *mockSnapshot) RandomSource() ([]byte, error)                            { return nil, nil }
+func (m *mockSnapshot) EpochPhase() (flow.EpochPhase, error)                     { return flow.EpochPhaseUndefined, nil }
+func (m *mockSnapshot) Epochs() protocol.EpochQuery                              { return nil }
+func (m *mockSnapshot) Params() protocol.GlobalParams                            { return nil }
+func (m *mockSnapshot) EpochProtocolState() (protocol.EpochProtocolState, error) { return nil, nil }
+func (m *mockSnapshot) ProtocolState() (protocol.KVStoreReader, error)           { return nil, nil }
+func (m *mockSnapshot) VersionBeacon() (*flow.SealedVersionBeacon, error)        { return nil, nil }

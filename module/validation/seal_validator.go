@@ -3,7 +3,8 @@ package validation
 import (
 	"fmt"
 
-	"github.com/onflow/flow-go/crypto/hash"
+	"github.com/onflow/crypto/hash"
+
 	"github.com/onflow/flow-go/engine"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module"
@@ -130,7 +131,7 @@ func (s *sealValidator) Validate(candidate *flow.Block) (*flow.Seal, error) {
 		byBlock[seal.BlockID] = seal
 	}
 	if len(payload.Seals) != len(byBlock) {
-		return nil, engine.NewInvalidInputError("multiple seals for the same block")
+		return nil, engine.NewInvalidInputErrorf("multiple seals for the same block")
 	}
 
 	// incorporatedResults collects execution results that are incorporated in unsealed
@@ -290,7 +291,11 @@ func (s *sealValidator) validateSeal(seal *flow.Seal, incorporatedResult *flow.I
 
 		// only Verification Nodes that were assigned to the chunk are allowed to approve it
 		for _, signerId := range chunkSigs.SignerIDs {
-			if !assignments.HasVerifier(chunk, signerId) {
+			b, err := assignments.HasVerifier(chunk.Index, signerId)
+			if err != nil {
+				return fmt.Errorf("getting verifiers for chunk %d failed: %w", chunk.Index, err)
+			}
+			if !b {
 				return engine.NewInvalidInputErrorf("invalid signer id at chunk: %d", chunk.Index)
 			}
 		}

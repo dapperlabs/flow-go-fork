@@ -12,7 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"github.com/stretchr/testify/suite"
 
-	"github.com/onflow/flow-go/crypto"
+	"github.com/onflow/crypto"
+
 	"github.com/onflow/flow-go/engine/consensus/dkg"
 	"github.com/onflow/flow-go/model/flow"
 	dkgmodule "github.com/onflow/flow-go/module/dkg"
@@ -123,7 +124,7 @@ func (suite *ReactorEngineSuite_SetupPhase) SetupTest() {
 	suite.currentEpoch.On("DKGPhase3FinalView").Return(suite.dkgPhase3FinalView, nil)
 	suite.nextEpoch = new(protocol.Epoch)
 	suite.nextEpoch.On("Counter").Return(suite.NextEpochCounter(), nil)
-	suite.nextEpoch.On("InitialIdentities").Return(suite.committee, nil)
+	suite.nextEpoch.On("InitialIdentities").Return(suite.committee.ToSkeleton(), nil)
 
 	suite.epochQuery = mocks.NewEpochQuery(suite.T(), suite.epochCounter)
 	suite.epochQuery.Add(suite.currentEpoch)
@@ -162,7 +163,7 @@ func (suite *ReactorEngineSuite_SetupPhase) SetupTest() {
 	suite.factory = new(module.DKGControllerFactory)
 	suite.factory.On("Create",
 		dkgmodule.CanonicalInstanceID(suite.firstBlock.ChainID, suite.NextEpochCounter()),
-		suite.committee,
+		suite.committee.ToSkeleton(),
 		mock.Anything,
 	).Return(suite.controller, nil)
 
@@ -208,7 +209,7 @@ func (suite *ReactorEngineSuite_SetupPhase) TestRunDKG_PhaseTransition() {
 func (suite *ReactorEngineSuite_SetupPhase) TestRunDKG_StartupInSetupPhase() {
 
 	// we are in the EpochSetup phase
-	suite.snapshot.On("Phase").Return(flow.EpochPhaseSetup, nil).Once()
+	suite.snapshot.On("EpochPhase").Return(flow.EpochPhaseSetup, nil).Once()
 	// the dkg for this epoch has not been started
 	suite.dkgState.On("GetDKGStarted", suite.NextEpochCounter()).Return(false, nil).Once()
 
@@ -237,7 +238,7 @@ func (suite *ReactorEngineSuite_SetupPhase) TestRunDKG_StartupInSetupPhase() {
 func (suite *ReactorEngineSuite_SetupPhase) TestRunDKG_StartupInSetupPhase_DKGAlreadyStarted() {
 
 	// we are in the EpochSetup phase
-	suite.snapshot.On("Phase").Return(flow.EpochPhaseSetup, nil).Once()
+	suite.snapshot.On("EpochPhase").Return(flow.EpochPhaseSetup, nil).Once()
 	// the dkg for this epoch has been started
 	suite.dkgState.On("GetDKGStarted", suite.NextEpochCounter()).Return(true, nil).Once()
 
@@ -434,7 +435,7 @@ func (suite *ReactorEngineSuite_CommittedPhase) TestLocalDKGFailure() {
 func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_DKGSuccess() {
 
 	// we are in the EpochSetup phase
-	suite.snap.On("Phase").Return(flow.EpochPhaseCommitted, nil).Once()
+	suite.snap.On("EpochPhase").Return(flow.EpochPhaseCommitted, nil).Once()
 	// the dkg for this epoch has been started but not ended
 	suite.dkgState.On("GetDKGStarted", suite.NextEpochCounter()).Return(true, nil).Once()
 	suite.dkgState.On("GetDKGEndState", suite.NextEpochCounter()).Return(flow.DKGEndStateUnknown, storerr.ErrNotFound).Once()
@@ -457,7 +458,7 @@ func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_DKGS
 func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_DKGEndStateAlreadySet() {
 
 	// we are in the EpochSetup phase
-	suite.snap.On("Phase").Return(flow.EpochPhaseCommitted, nil).Once()
+	suite.snap.On("EpochPhase").Return(flow.EpochPhaseCommitted, nil).Once()
 	// the dkg for this epoch has been started and ended
 	suite.dkgState.On("GetDKGStarted", suite.NextEpochCounter()).Return(true, nil).Once()
 	suite.dkgState.On("GetDKGEndState", suite.NextEpochCounter()).Return(flow.DKGEndStateNoKey, nil).Once()
@@ -478,7 +479,7 @@ func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_DKGE
 func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_InconsistentKey() {
 
 	// we are in the EpochSetup phase
-	suite.snap.On("Phase").Return(flow.EpochPhaseCommitted, nil).Once()
+	suite.snap.On("EpochPhase").Return(flow.EpochPhaseCommitted, nil).Once()
 	// the dkg for this epoch has been started but not ended
 	suite.dkgState.On("GetDKGStarted", suite.NextEpochCounter()).Return(true, nil).Once()
 	suite.dkgState.On("GetDKGEndState", suite.NextEpochCounter()).Return(flow.DKGEndStateUnknown, storerr.ErrNotFound).Once()
@@ -504,7 +505,7 @@ func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_Inco
 func (suite *ReactorEngineSuite_CommittedPhase) TestStartupInCommittedPhase_MissingKey() {
 
 	// we are in the EpochSetup phase
-	suite.snap.On("Phase").Return(flow.EpochPhaseCommitted, nil).Once()
+	suite.snap.On("EpochPhase").Return(flow.EpochPhaseCommitted, nil).Once()
 	// the dkg for this epoch has been started but not ended
 	suite.dkgState.On("GetDKGStarted", suite.NextEpochCounter()).Return(true, nil).Once()
 	suite.dkgState.On("GetDKGEndState", suite.NextEpochCounter()).Return(flow.DKGEndStateUnknown, storerr.ErrNotFound).Once()

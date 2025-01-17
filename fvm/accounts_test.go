@@ -6,8 +6,10 @@ import (
 	"testing"
 
 	"github.com/onflow/cadence"
+	"github.com/onflow/cadence/encoding/ccf"
 	jsoncdc "github.com/onflow/cadence/encoding/json"
-	"github.com/onflow/cadence/runtime/format"
+	"github.com/onflow/cadence/format"
+	"github.com/onflow/cadence/stdlib"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
@@ -70,10 +72,17 @@ func createAccount(
 
 	require.Len(t, accountCreatedEvents, 1)
 
-	data, err := jsoncdc.Decode(nil, accountCreatedEvents[0].Payload)
+	data, err := ccf.Decode(nil, accountCreatedEvents[0].Payload)
 	require.NoError(t, err)
+
+	event := data.(cadence.Event)
+
 	address := flow.ConvertAddress(
-		data.(cadence.Event).Fields[0].(cadence.Address))
+		cadence.SearchFieldByName(
+			event,
+			stdlib.AccountEventAddressParameter.Identifier,
+		).(cadence.Address),
+	)
 
 	return snapshotTree, address
 }
@@ -102,15 +111,8 @@ func addAccountKey(
 
 	publicKeyA, cadencePublicKey := newAccountKey(t, privateKey, apiVersion)
 
-	var addAccountKeyTx accountKeyAPIVersion
-	if apiVersion == accountKeyAPIVersionV1 {
-		addAccountKeyTx = addAccountKeyTransaction
-	} else {
-		addAccountKeyTx = addAccountKeyTransactionV2
-	}
-
 	txBody := flow.NewTransactionBody().
-		SetScript([]byte(addAccountKeyTx)).
+		SetScript([]byte(addAccountKeyTransaction)).
 		AddArgument(cadencePublicKey).
 		AddAuthorizer(address)
 
@@ -187,100 +189,72 @@ func removeAccountCreator(
 
 const createAccountTransaction = `
 transaction {
-  prepare(signer: AuthAccount) {
-    let account = AuthAccount(payer: signer)
+  prepare(signer: auth(BorrowValue) &Account) {
+    let account = Account(payer: signer)
   }
 }
 `
 
 const createMultipleAccountsTransaction = `
 transaction {
-  prepare(signer: AuthAccount) {
-    let accountA = AuthAccount(payer: signer)
-    let accountB = AuthAccount(payer: signer)
-    let accountC = AuthAccount(payer: signer)
+  prepare(signer: auth(BorrowValue) &Account) {
+    let accountA = Account(payer: signer)
+    let accountB = Account(payer: signer)
+    let accountC = Account(payer: signer)
   }
 }
 `
 
 const addAccountKeyTransaction = `
 transaction(key: [UInt8]) {
-  prepare(signer: AuthAccount) {
-    signer.addPublicKey(key)
-  }
-}
-`
-const addAccountKeyTransactionV2 = `
-transaction(key: [UInt8]) {
-  prepare(signer: AuthAccount) {
-    let publicKey = PublicKey(
-	  publicKey: key,
-	  signatureAlgorithm: SignatureAlgorithm.ECDSA_P256
-	)
+  prepare(signer: auth(AddKey) &Account) {
+	let publicKey = PublicKey(
+		publicKey: key,
+		signatureAlgorithm: SignatureAlgorithm.ECDSA_P256
+	 )
     signer.keys.add(
-      publicKey: publicKey,
-      hashAlgorithm: HashAlgorithm.SHA3_256,
-      weight: 1000.0
-    )
+		publicKey: publicKey,
+		hashAlgorithm: HashAlgorithm.SHA3_256,
+		weight: 1000.0
+	)
   }
 }
 `
 
 const addMultipleAccountKeysTransaction = `
 transaction(key1: [UInt8], key2: [UInt8]) {
-  prepare(signer: AuthAccount) {
-    signer.addPublicKey(key1)
-    signer.addPublicKey(key2)
-  }
-}
-`
-
-const addMultipleAccountKeysTransactionV2 = `
-transaction(key1: [UInt8], key2: [UInt8]) {
-  prepare(signer: AuthAccount) {
-    for key in [key1, key2] {
-      let publicKey = PublicKey(
-	    publicKey: key,
-	    signatureAlgorithm: SignatureAlgorithm.ECDSA_P256
-	  )
-      signer.keys.add(
-        publicKey: publicKey,
-        hashAlgorithm: HashAlgorithm.SHA3_256,
-        weight: 1000.0
-      )
-    }
-  }
-}
-`
-
-const removeAccountKeyTransaction = `
-transaction(key: Int) {
-  prepare(signer: AuthAccount) {
-    signer.removePublicKey(key)
+  prepare(signer: auth(AddKey) &Account) {
+    signer.keys.add(
+		publicKey: PublicKey(
+			publicKey: key1,
+			signatureAlgorithm: SignatureAlgorithm.ECDSA_P256
+		),
+		hashAlgorithm: HashAlgorithm.SHA3_256,
+		weight: 1000.0
+	)
+    signer.keys.add(
+		publicKey: PublicKey(
+			publicKey: key2,
+			signatureAlgorithm: SignatureAlgorithm.ECDSA_P256
+		),
+		hashAlgorithm: HashAlgorithm.SHA3_256,
+		weight: 1000.0
+	)
   }
 }
 `
 
 const revokeAccountKeyTransaction = `
 transaction(keyIndex: Int) {
-  prepare(signer: AuthAccount) {
+  prepare(signer: auth(RevokeKey) &Account) {
     signer.keys.revoke(keyIndex: keyIndex)
-  }
-}
-`
-
-const removeMultipleAccountKeysTransaction = `
-transaction(key1: Int, key2: Int) {
-  prepare(signer: AuthAccount) {
-    signer.removePublicKey(key1)
-    signer.removePublicKey(key2)
   }
 }
 `
 
 const revokeMultipleAccountKeysTransaction = `
 transaction(keyIndex1: Int, keyIndex2: Int) {
-  prepare(signer: AuthAccount) {
+  prepare(signer: auth(RevokeKey) &Account) {
     for keyIndex in [keyIndex1, keyIndex2] {
       signer.keys.revoke(keyIndex: keyIndex)
     }
@@ -292,10 +266,10 @@ const removeAccountCreatorTransactionTemplate = `
 import FlowServiceAccount from 0x%s
 transaction {
 	let serviceAccountAdmin: &FlowServiceAccount.Administrator
-	prepare(signer: AuthAccount) {
+	prepare(signer: auth(BorrowValue) &Account) {
 		// Borrow reference to FlowServiceAccount Administrator resource.
 		//
-		self.serviceAccountAdmin = signer.borrow<&FlowServiceAccount.Administrator>(from: /storage/flowServiceAdmin)
+		self.serviceAccountAdmin = signer.storage.borrow<&FlowServiceAccount.Administrator>(from: /storage/flowServiceAdmin)
 			?? panic("Unable to borrow reference to administrator resource")
 	}
 	execute {
@@ -312,10 +286,10 @@ const addAccountCreatorTransactionTemplate = `
 import FlowServiceAccount from 0x%s
 transaction {
 	let serviceAccountAdmin: &FlowServiceAccount.Administrator
-	prepare(signer: AuthAccount) {
+	prepare(signer: auth(BorrowValue) &Account) {
 		// Borrow reference to FlowServiceAccount Administrator resource.
 		//
-		self.serviceAccountAdmin = signer.borrow<&FlowServiceAccount.Administrator>(from: /storage/flowServiceAdmin)
+		self.serviceAccountAdmin = signer.storage.borrow<&FlowServiceAccount.Administrator>(from: /storage/flowServiceAdmin)
 			?? panic("Unable to borrow reference to administrator resource")
 	}
 	execute {
@@ -330,19 +304,17 @@ transaction {
 
 const getAccountKeyTransaction = `
 transaction(keyIndex: Int) {
-  prepare(signer: AuthAccount) {
-    var key :AccountKey? = signer.keys.get(keyIndex: keyIndex)
-    log(key)
+  prepare(signer: &Account) {
+    log(signer.keys.get(keyIndex: keyIndex))
   }
 }
 `
 
 const getMultipleAccountKeysTransaction = `
 transaction(keyIndex1: Int, keyIndex2: Int) {
-  prepare(signer: AuthAccount) {
+  prepare(signer: &Account) {
     for keyIndex in [keyIndex1, keyIndex2] {
-      var key :AccountKey? = signer.keys.get(keyIndex: keyIndex)
-      log(key)
+      log(signer.keys.get(keyIndex: keyIndex))
     }
   }
 }
@@ -407,12 +379,19 @@ func TestCreateAccount(t *testing.T) {
 				accountCreatedEvents := filterAccountCreatedEvents(output.Events)
 				require.Len(t, accountCreatedEvents, 1)
 
-				data, err := jsoncdc.Decode(nil, accountCreatedEvents[0].Payload)
+				data, err := ccf.Decode(nil, accountCreatedEvents[0].Payload)
 				require.NoError(t, err)
-				address := flow.ConvertAddress(
-					data.(cadence.Event).Fields[0].(cadence.Address))
 
-				account, err := vm.GetAccount(ctx, address, snapshotTree)
+				event := data.(cadence.Event)
+
+				address := flow.ConvertAddress(
+					cadence.SearchFieldByName(
+						event,
+						stdlib.AccountEventAddressParameter.Identifier,
+					).(cadence.Address),
+				)
+
+				account, err := fvm.GetAccount(ctx, address, snapshotTree)
 				require.NoError(t, err)
 				require.NotNil(t, account)
 			}),
@@ -450,12 +429,18 @@ func TestCreateAccount(t *testing.T) {
 					}
 					accountCreatedEventCount += 1
 
-					data, err := jsoncdc.Decode(nil, event.Payload)
+					data, err := ccf.Decode(nil, event.Payload)
 					require.NoError(t, err)
-					address := flow.ConvertAddress(
-						data.(cadence.Event).Fields[0].(cadence.Address))
 
-					account, err := vm.GetAccount(ctx, address, snapshotTree)
+					event := data.(cadence.Event)
+
+					address := flow.ConvertAddress(
+						cadence.SearchFieldByName(
+							event,
+							stdlib.AccountEventAddressParameter.Identifier,
+						).(cadence.Address),
+					)
+					account, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					require.NotNil(t, account)
 				}
@@ -615,17 +600,13 @@ func TestAddAccountKey(t *testing.T) {
 	singleKeyTests := []addKeyTest{
 		{
 			source:     addAccountKeyTransaction,
-			apiVersion: accountKeyAPIVersionV1,
-		},
-		{
-			source:     addAccountKeyTransactionV2,
 			apiVersion: accountKeyAPIVersionV2,
 		},
 	}
 
 	for _, test := range singleKeyTests {
 
-		t.Run(fmt.Sprintf("Add to empty key list %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Add to empty key list %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -635,14 +616,14 @@ func TestAddAccountKey(t *testing.T) {
 						ctx,
 						snapshotTree)
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Empty(t, before.Keys)
 
 					privateKey, err := unittest.AccountKeyDefaultFixture()
 					require.NoError(t, err)
 
-					publicKeyA, cadencePublicKey := newAccountKey(t, privateKey, test.apiVersion)
+					publicKeyA, cadencePublicKey := newAccountKey(t, privateKey, accountKeyAPIVersionV2)
 
 					txBody := flow.NewTransactionBody().
 						SetScript([]byte(test.source)).
@@ -659,7 +640,7 @@ func TestAddAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 
 					require.Len(t, after.Keys, 1)
@@ -673,7 +654,7 @@ func TestAddAccountKey(t *testing.T) {
 				}),
 		)
 
-		t.Run(fmt.Sprintf("Add to non-empty key list %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Add to non-empty key list %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -689,16 +670,16 @@ func TestAddAccountKey(t *testing.T) {
 						ctx,
 						snapshotTree,
 						address,
-						test.apiVersion)
+						accountKeyAPIVersionV2)
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, before.Keys, 1)
 
 					privateKey, err := unittest.AccountKeyDefaultFixture()
 					require.NoError(t, err)
 
-					publicKey2, publicKey2Arg := newAccountKey(t, privateKey, test.apiVersion)
+					publicKey2, publicKey2Arg := newAccountKey(t, privateKey, accountKeyAPIVersionV2)
 
 					txBody := flow.NewTransactionBody().
 						SetScript([]byte(test.source)).
@@ -714,7 +695,7 @@ func TestAddAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 
 					expectedKeys := []flow.AccountPublicKey{
@@ -726,7 +707,7 @@ func TestAddAccountKey(t *testing.T) {
 
 					for i, expectedKey := range expectedKeys {
 						actualKey := after.Keys[i]
-						assert.Equal(t, i, actualKey.Index)
+						assert.Equal(t, uint32(i), actualKey.Index)
 						assert.Equal(t, expectedKey.PublicKey, actualKey.PublicKey)
 						assert.Equal(t, expectedKey.SignAlgo, actualKey.SignAlgo)
 						assert.Equal(t, expectedKey.HashAlgo, actualKey.HashAlgo)
@@ -735,7 +716,7 @@ func TestAddAccountKey(t *testing.T) {
 				}),
 		)
 
-		t.Run(fmt.Sprintf("Invalid key %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Invalid key %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -763,7 +744,7 @@ func TestAddAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 
 					assert.Empty(t, after.Keys)
@@ -776,16 +757,12 @@ func TestAddAccountKey(t *testing.T) {
 	multipleKeysTests := []addKeyTest{
 		{
 			source:     addMultipleAccountKeysTransaction,
-			apiVersion: accountKeyAPIVersionV1,
-		},
-		{
-			source:     addMultipleAccountKeysTransactionV2,
 			apiVersion: accountKeyAPIVersionV2,
 		},
 	}
 
 	for _, test := range multipleKeysTests {
-		t.Run(fmt.Sprintf("Multiple keys %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Multiple keys %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -795,7 +772,7 @@ func TestAddAccountKey(t *testing.T) {
 						ctx,
 						snapshotTree)
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Empty(t, before.Keys)
 
@@ -805,8 +782,8 @@ func TestAddAccountKey(t *testing.T) {
 					privateKey2, err := unittest.AccountKeyDefaultFixture()
 					require.NoError(t, err)
 
-					publicKey1, publicKey1Arg := newAccountKey(t, privateKey1, test.apiVersion)
-					publicKey2, publicKey2Arg := newAccountKey(t, privateKey2, test.apiVersion)
+					publicKey1, publicKey1Arg := newAccountKey(t, privateKey1, accountKeyAPIVersionV2)
+					publicKey2, publicKey2Arg := newAccountKey(t, privateKey2, accountKeyAPIVersionV2)
 
 					txBody := flow.NewTransactionBody().
 						SetScript([]byte(test.source)).
@@ -823,7 +800,7 @@ func TestAddAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 
 					expectedKeys := []flow.AccountPublicKey{
@@ -867,7 +844,7 @@ func TestAddAccountKey(t *testing.T) {
 							SetScript([]byte(fmt.Sprintf(
 								`
 								transaction(key: [UInt8]) {
-								  prepare(signer: AuthAccount) {
+								  prepare(signer: auth(AddKey) &Account) {
 								    let publicKey = PublicKey(
 									  publicKey: key,
 									  signatureAlgorithm: SignatureAlgorithm.ECDSA_P256
@@ -899,7 +876,7 @@ func TestAddAccountKey(t *testing.T) {
 
 						snapshotTree = snapshotTree.Append(executionSnapshot)
 
-						after, err := vm.GetAccount(ctx, address, snapshotTree)
+						after, err := fvm.GetAccount(ctx, address, snapshotTree)
 						require.NoError(t, err)
 
 						assert.Empty(t, after.Keys)
@@ -926,11 +903,6 @@ func TestRemoveAccountKey(t *testing.T) {
 
 	singleKeyTests := []removeKeyTest{
 		{
-			source:      removeAccountKeyTransaction,
-			apiVersion:  accountKeyAPIVersionV1,
-			expectError: true,
-		},
-		{
 			source:      revokeAccountKeyTransaction,
 			apiVersion:  accountKeyAPIVersionV2,
 			expectError: false,
@@ -939,7 +911,7 @@ func TestRemoveAccountKey(t *testing.T) {
 
 	for _, test := range singleKeyTests {
 
-		t.Run(fmt.Sprintf("Non-existent key %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Non-existent key %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -958,14 +930,14 @@ func TestRemoveAccountKey(t *testing.T) {
 							ctx,
 							snapshotTree,
 							address,
-							test.apiVersion)
+							accountKeyAPIVersionV2)
 					}
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, before.Keys, keyCount)
 
-					for _, keyIndex := range []int{-1, keyCount, keyCount + 1} {
+					for _, keyIndex := range []int{keyCount, keyCount + 1} {
 						keyIndexArg, err := jsoncdc.Encode(cadence.NewInt(keyIndex))
 						require.NoError(t, err)
 
@@ -989,7 +961,7 @@ func TestRemoveAccountKey(t *testing.T) {
 						snapshotTree = snapshotTree.Append(executionSnapshot)
 					}
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, after.Keys, keyCount)
 
@@ -999,7 +971,7 @@ func TestRemoveAccountKey(t *testing.T) {
 				}),
 		)
 
-		t.Run(fmt.Sprintf("Existing key %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Existing key %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -1019,10 +991,10 @@ func TestRemoveAccountKey(t *testing.T) {
 							ctx,
 							snapshotTree,
 							address,
-							test.apiVersion)
+							accountKeyAPIVersionV2)
 					}
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, before.Keys, keyCount)
 
@@ -1043,7 +1015,7 @@ func TestRemoveAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, after.Keys, keyCount)
 
@@ -1055,7 +1027,7 @@ func TestRemoveAccountKey(t *testing.T) {
 				}),
 		)
 
-		t.Run(fmt.Sprintf("Key added by a different api version %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Key added by a different api version %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -1068,14 +1040,6 @@ func TestRemoveAccountKey(t *testing.T) {
 					const keyCount = 2
 					const keyIndex = keyCount - 1
 
-					// Use one version of API to add the keys, and a different version of the API to revoke the keys.
-					var apiVersionForAdding accountKeyAPIVersion
-					if test.apiVersion == accountKeyAPIVersionV1 {
-						apiVersionForAdding = accountKeyAPIVersionV2
-					} else {
-						apiVersionForAdding = accountKeyAPIVersionV1
-					}
-
 					for i := 0; i < keyCount; i++ {
 						snapshotTree, _ = addAccountKey(
 							t,
@@ -1083,10 +1047,10 @@ func TestRemoveAccountKey(t *testing.T) {
 							ctx,
 							snapshotTree,
 							address,
-							apiVersionForAdding)
+							accountKeyAPIVersionV2)
 					}
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, before.Keys, keyCount)
 
@@ -1107,7 +1071,7 @@ func TestRemoveAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, after.Keys, keyCount)
 
@@ -1124,17 +1088,13 @@ func TestRemoveAccountKey(t *testing.T) {
 
 	multipleKeysTests := []removeKeyTest{
 		{
-			source:     removeMultipleAccountKeysTransaction,
-			apiVersion: accountKeyAPIVersionV1,
-		},
-		{
 			source:     revokeMultipleAccountKeysTransaction,
 			apiVersion: accountKeyAPIVersionV2,
 		},
 	}
 
 	for _, test := range multipleKeysTests {
-		t.Run(fmt.Sprintf("Multiple keys %s", test.apiVersion),
+		t.Run(fmt.Sprintf("Multiple keys %s", accountKeyAPIVersionV2),
 			newVMTest().withContextOptions(options...).
 				run(func(t *testing.T, vm fvm.VM, chain flow.Chain, ctx fvm.Context, snapshotTree snapshot.SnapshotTree) {
 					snapshotTree, address := createAccount(
@@ -1153,10 +1113,10 @@ func TestRemoveAccountKey(t *testing.T) {
 							ctx,
 							snapshotTree,
 							address,
-							test.apiVersion)
+							accountKeyAPIVersionV2)
 					}
 
-					before, err := vm.GetAccount(ctx, address, snapshotTree)
+					before, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, before.Keys, keyCount)
 
@@ -1180,7 +1140,7 @@ func TestRemoveAccountKey(t *testing.T) {
 
 					snapshotTree = snapshotTree.Append(executionSnapshot)
 
-					after, err := vm.GetAccount(ctx, address, snapshotTree)
+					after, err := fvm.GetAccount(ctx, address, snapshotTree)
 					require.NoError(t, err)
 					assert.Len(t, after.Keys, keyCount)
 
@@ -1222,11 +1182,11 @@ func TestGetAccountKey(t *testing.T) {
 						accountKeyAPIVersionV2)
 				}
 
-				before, err := vm.GetAccount(ctx, address, snapshotTree)
+				before, err := fvm.GetAccount(ctx, address, snapshotTree)
 				require.NoError(t, err)
 				assert.Len(t, before.Keys, keyCount)
 
-				for _, keyIndex := range []int{-1, keyCount, keyCount + 1} {
+				for _, keyIndex := range []int{keyCount, keyCount + 1} {
 					keyIndexArg, err := jsoncdc.Encode(cadence.NewInt(keyIndex))
 					require.NoError(t, err)
 
@@ -1274,7 +1234,7 @@ func TestGetAccountKey(t *testing.T) {
 						accountKeyAPIVersionV2)
 				}
 
-				before, err := vm.GetAccount(ctx, address, snapshotTree)
+				before, err := fvm.GetAccount(ctx, address, snapshotTree)
 				require.NoError(t, err)
 				assert.Len(t, before.Keys, keyCount)
 
@@ -1335,10 +1295,10 @@ func TestGetAccountKey(t *testing.T) {
 						ctx,
 						snapshotTree,
 						address,
-						accountKeyAPIVersionV1)
+						accountKeyAPIVersionV2)
 				}
 
-				before, err := vm.GetAccount(ctx, address, snapshotTree)
+				before, err := fvm.GetAccount(ctx, address, snapshotTree)
 				require.NoError(t, err)
 				assert.Len(t, before.Keys, keyCount)
 
@@ -1400,7 +1360,7 @@ func TestGetAccountKey(t *testing.T) {
 						accountKeyAPIVersionV2)
 				}
 
-				before, err := vm.GetAccount(ctx, address, snapshotTree)
+				before, err := fvm.GetAccount(ctx, address, snapshotTree)
 				require.NoError(t, err)
 				assert.Len(t, before.Keys, keyCount)
 
@@ -1482,7 +1442,7 @@ func TestAccountBalanceFields(t *testing.T) {
 				snapshotTree = snapshotTree.Append(executionSnapshot)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UFix64 {
+					access(all) fun main(): UFix64 {
 						let acc = getAccount(0x%s)
 						return acc.balance
 					}
@@ -1512,7 +1472,7 @@ func TestAccountBalanceFields(t *testing.T) {
 				require.NoError(t, err)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UFix64 {
+					access(all) fun main(): UFix64 {
 						let acc = getAccount(0x%s)
 						return acc.balance
 					}
@@ -1543,7 +1503,7 @@ func TestAccountBalanceFields(t *testing.T) {
 					snapshotTree)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UFix64 {
+					access(all) fun main(): UFix64 {
 						let acc = getAccount(0x%s)
 						return acc.balance
 					}
@@ -1596,7 +1556,7 @@ func TestAccountBalanceFields(t *testing.T) {
 				snapshotTree = snapshotTree.Append(executionSnapshot)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UFix64 {
+					access(all) fun main(): UFix64 {
 						let acc = getAccount(0x%s)
 						return acc.availableBalance
 					}
@@ -1605,7 +1565,7 @@ func TestAccountBalanceFields(t *testing.T) {
 				_, output, err = vm.Run(ctx, script, snapshotTree)
 				assert.NoError(t, err)
 				assert.NoError(t, output.Err)
-				assert.Equal(t, cadence.UFix64(9999_3120), output.Value)
+				assert.Equal(t, cadence.UFix64(99_990_990), output.Value)
 			}),
 	)
 
@@ -1623,7 +1583,7 @@ func TestAccountBalanceFields(t *testing.T) {
 				require.NoError(t, err)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UFix64 {
+					access(all) fun main(): UFix64 {
 						let acc = getAccount(0x%s)
 						return acc.availableBalance
 					}
@@ -1669,7 +1629,7 @@ func TestAccountBalanceFields(t *testing.T) {
 				snapshotTree = snapshotTree.Append(executionSnapshot)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UFix64 {
+					access(all) fun main(): UFix64 {
 						let acc = getAccount(0x%s)
 						return acc.availableBalance
 					}
@@ -1720,9 +1680,9 @@ func TestGetStorageCapacity(t *testing.T) {
 				snapshotTree = snapshotTree.Append(executionSnapshot)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UInt64 {
+					access(all) fun main(): UInt64 {
 						let acc = getAccount(0x%s)
-						return acc.storageCapacity
+						return acc.storage.capacity
 					}
 				`, account)))
 
@@ -1749,9 +1709,9 @@ func TestGetStorageCapacity(t *testing.T) {
 				require.NoError(t, err)
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UInt64 {
+					access(all) fun main(): UInt64 {
 						let acc = getAccount(0x%s)
-						return acc.storageCapacity
+						return acc.storage.capacity
 					}
 				`, nonExistentAddress)))
 
@@ -1777,9 +1737,9 @@ func TestGetStorageCapacity(t *testing.T) {
 				address := chain.ServiceAddress()
 
 				script := fvm.Script([]byte(fmt.Sprintf(`
-					pub fun main(): UInt64 {
+					access(all) fun main(): UInt64 {
 						let acc = getAccount(0x%s)
-						return acc.storageCapacity
+						return acc.storage.capacity
 					}
 				`, address)))
 

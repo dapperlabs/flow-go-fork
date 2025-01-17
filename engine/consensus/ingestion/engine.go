@@ -1,5 +1,3 @@
-// (c) 2019 Dapper Labs - ALL RIGHTS RESERVED
-
 package ingestion
 
 import (
@@ -43,7 +41,7 @@ type Engine struct {
 func New(
 	log zerolog.Logger,
 	engineMetrics module.EngineMetrics,
-	net network.Network,
+	net network.EngineRegistry,
 	me module.Local,
 	core *Core,
 ) (*Engine, error) {

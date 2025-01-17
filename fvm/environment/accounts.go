@@ -8,25 +8,26 @@ import (
 
 	"github.com/fxamacker/cbor/v2"
 	"github.com/onflow/atree"
+	"github.com/onflow/crypto"
+	"github.com/onflow/crypto/hash"
 
-	"github.com/onflow/flow-go/crypto"
-	"github.com/onflow/flow-go/crypto/hash"
 	"github.com/onflow/flow-go/fvm/errors"
 	"github.com/onflow/flow-go/fvm/storage/state"
 	"github.com/onflow/flow-go/model/flow"
 )
 
 const (
-	MaxPublicKeyCount = math.MaxUint64
+	MaxPublicKeyCount = math.MaxUint32
 )
 
 type Accounts interface {
 	Exists(address flow.Address) (bool, error)
 	Get(address flow.Address) (*flow.Account, error)
-	GetPublicKeyCount(address flow.Address) (uint64, error)
+	GetPublicKeyCount(address flow.Address) (uint32, error)
 	AppendPublicKey(address flow.Address, key flow.AccountPublicKey) error
-	GetPublicKey(address flow.Address, keyIndex uint64) (flow.AccountPublicKey, error)
-	SetPublicKey(address flow.Address, keyIndex uint64, publicKey flow.AccountPublicKey) ([]byte, error)
+	GetPublicKey(address flow.Address, keyIndex uint32) (flow.AccountPublicKey, error)
+	SetPublicKey(address flow.Address, keyIndex uint32, publicKey flow.AccountPublicKey) ([]byte, error)
+	GetPublicKeys(address flow.Address) ([]flow.AccountPublicKey, error)
 	GetContractNames(address flow.Address) ([]string, error)
 	GetContract(contractName string, address flow.Address) ([]byte, error)
 	ContractExists(contractName string, address flow.Address) (bool, error)
@@ -36,7 +37,8 @@ type Accounts interface {
 	GetValue(id flow.RegisterID) (flow.RegisterValue, error)
 	GetStorageUsed(address flow.Address) (uint64, error)
 	SetValue(id flow.RegisterID, value flow.RegisterValue) error
-	AllocateStorageIndex(address flow.Address) (atree.StorageIndex, error)
+	AllocateSlabIndex(address flow.Address) (atree.SlabIndex, error)
+	GenerateAccountLocalID(address flow.Address) (uint64, error)
 }
 
 var _ Accounts = &StatefulAccounts{}
@@ -51,20 +53,20 @@ func NewAccounts(txnState state.NestedTransactionPreparer) *StatefulAccounts {
 	}
 }
 
-func (a *StatefulAccounts) AllocateStorageIndex(
+func (a *StatefulAccounts) AllocateSlabIndex(
 	address flow.Address,
 ) (
-	atree.StorageIndex,
+	atree.SlabIndex,
 	error,
 ) {
 	// get status
 	status, err := a.getAccountStatus(address)
 	if err != nil {
-		return atree.StorageIndex{}, err
+		return atree.SlabIndex{}, err
 	}
 
 	// get and increment the index
-	index := status.StorageIndex()
+	index := status.SlabIndex()
 	newIndexBytes := index.Next()
 
 	// store nil so that the setValue for new allocated slabs would be faster
@@ -74,11 +76,11 @@ func (a *StatefulAccounts) AllocateStorageIndex(
 	key := atree.SlabIndexToLedgerKey(index)
 	a.txnState.RunWithAllLimitsDisabled(func() {
 		err = a.txnState.Set(
-			flow.NewRegisterID(string(address.Bytes()), string(key)),
+			flow.NewRegisterID(address, string(key)),
 			[]byte{})
 	})
 	if err != nil {
-		return atree.StorageIndex{}, fmt.Errorf(
+		return atree.SlabIndex{}, fmt.Errorf(
 			"failed to allocate an storage index: %w",
 			err)
 	}
@@ -87,7 +89,7 @@ func (a *StatefulAccounts) AllocateStorageIndex(
 	status.SetStorageIndex(newIndexBytes)
 	err = a.setAccountStatus(address, status)
 	if err != nil {
-		return atree.StorageIndex{}, fmt.Errorf(
+		return atree.SlabIndex{}, fmt.Errorf(
 			"failed to allocate an storage index: %w",
 			err)
 	}
@@ -184,7 +186,7 @@ func (a *StatefulAccounts) Create(
 
 func (a *StatefulAccounts) GetPublicKey(
 	address flow.Address,
-	keyIndex uint64,
+	keyIndex uint32,
 ) (
 	flow.AccountPublicKey,
 	error,
@@ -213,7 +215,7 @@ func (a *StatefulAccounts) GetPublicKey(
 func (a *StatefulAccounts) GetPublicKeyCount(
 	address flow.Address,
 ) (
-	uint64,
+	uint32,
 	error,
 ) {
 	status, err := a.getAccountStatus(address)
@@ -225,7 +227,7 @@ func (a *StatefulAccounts) GetPublicKeyCount(
 
 func (a *StatefulAccounts) setPublicKeyCount(
 	address flow.Address,
-	count uint64,
+	count uint32,
 ) error {
 	status, err := a.getAccountStatus(address)
 	if err != nil {
@@ -255,13 +257,11 @@ func (a *StatefulAccounts) GetPublicKeys(
 ) {
 	count, err := a.GetPublicKeyCount(address)
 	if err != nil {
-		return nil, fmt.Errorf(
-			"failed to get public key count of account: %w",
-			err)
+		return nil, err
 	}
 	publicKeys = make([]flow.AccountPublicKey, count)
 
-	for i := uint64(0); i < count; i++ {
+	for i := uint32(0); i < count; i++ {
 		publicKey, err := a.GetPublicKey(address, i)
 		if err != nil {
 			return nil, err
@@ -275,7 +275,7 @@ func (a *StatefulAccounts) GetPublicKeys(
 
 func (a *StatefulAccounts) SetPublicKey(
 	address flow.Address,
-	keyIndex uint64,
+	keyIndex uint32,
 	publicKey flow.AccountPublicKey,
 ) (encodedPublicKey []byte, err error) {
 	err = publicKey.Validate()
@@ -308,7 +308,7 @@ func (a *StatefulAccounts) SetAllPublicKeys(
 	publicKeys []flow.AccountPublicKey,
 ) error {
 
-	count := uint64(len(publicKeys))
+	count := uint32(len(publicKeys))
 
 	if count >= MaxPublicKeyCount {
 		return errors.NewAccountPublicKeyLimitError(
@@ -318,7 +318,7 @@ func (a *StatefulAccounts) SetAllPublicKeys(
 	}
 
 	for i, publicKey := range publicKeys {
-		_, err := a.SetPublicKey(address, uint64(i), publicKey)
+		_, err := a.SetPublicKey(address, uint32(i), publicKey)
 		if err != nil {
 			return err
 		}
@@ -430,6 +430,20 @@ func (a *StatefulAccounts) setContract(
 	return nil
 }
 
+func EncodeContractNames(contractNames contractNames) ([]byte, error) {
+	var buf bytes.Buffer
+	cborEncoder := cbor.NewEncoder(&buf)
+	err := cborEncoder.Encode(contractNames)
+	if err != nil {
+		return nil, errors.NewEncodingFailuref(
+			err,
+			"cannot encode contract names: %s",
+			contractNames,
+		)
+	}
+	return buf.Bytes(), nil
+}
+
 func (a *StatefulAccounts) setContractNames(
 	contractNames contractNames,
 	address flow.Address,
@@ -442,16 +456,11 @@ func (a *StatefulAccounts) setContractNames(
 	if !ok {
 		return errors.NewAccountNotFoundError(address)
 	}
-	var buf bytes.Buffer
-	cborEncoder := cbor.NewEncoder(&buf)
-	err = cborEncoder.Encode(contractNames)
+
+	newContractNames, err := EncodeContractNames(contractNames)
 	if err != nil {
-		return errors.NewEncodingFailuref(
-			err,
-			"cannot encode contract names: %s",
-			contractNames)
+		return err
 	}
-	newContractNames := buf.Bytes()
 
 	id := flow.ContractNamesRegisterID(address)
 	prevContractNames, err := a.GetValue(id)
@@ -606,20 +615,26 @@ func (a *StatefulAccounts) getContractNames(
 	error,
 ) {
 	// TODO return fatal error if can't fetch
-	encContractNames, err := a.GetValue(flow.ContractNamesRegisterID(address))
+	encodedContractNames, err := a.GetValue(flow.ContractNamesRegisterID(address))
 	if err != nil {
 		return nil, fmt.Errorf("cannot get deployed contract names: %w", err)
 	}
+
+	return DecodeContractNames(encodedContractNames)
+}
+
+func DecodeContractNames(encodedContractNames []byte) ([]string, error) {
 	identifiers := make([]string, 0)
-	if len(encContractNames) > 0 {
-		buf := bytes.NewReader(encContractNames)
+	if len(encodedContractNames) > 0 {
+		buf := bytes.NewReader(encodedContractNames)
 		cborDecoder := cbor.NewDecoder(buf)
-		err = cborDecoder.Decode(&identifiers)
+		err := cborDecoder.Decode(&identifiers)
 		if err != nil {
 			return nil, fmt.Errorf(
 				"cannot decode deployed contract names %x: %w",
-				encContractNames,
-				err)
+				encodedContractNames,
+				err,
+			)
 		}
 	}
 	return identifiers, nil
@@ -696,6 +711,32 @@ func (a *StatefulAccounts) DeleteContract(
 	}
 	contractNames.remove(contractName)
 	return a.setContractNames(contractNames, address)
+}
+
+// GenerateAccountLocalID generates a new account local id for an address
+// it is sequential and starts at 1
+// Errors can happen if the account state cannot be read or written to
+func (a *StatefulAccounts) GenerateAccountLocalID(
+	address flow.Address,
+) (
+	uint64,
+	error,
+) {
+	as, err := a.getAccountStatus(address)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get account local id: %w", err)
+	}
+	id := as.AccountIdCounter()
+	// AccountLocalIDs are defined as non 0 so return the incremented value
+	// see: https://github.com/onflow/cadence/blob/2081a601106baaf6ae695e3f2a84613160bb2166/runtime/interface.go#L149
+	id += 1
+
+	as.SetAccountIdCounter(id)
+	err = a.setAccountStatus(address, as)
+	if err != nil {
+		return 0, fmt.Errorf("failed to get increment account local id: %w", err)
+	}
+	return id, nil
 }
 
 func (a *StatefulAccounts) getAccountStatus(

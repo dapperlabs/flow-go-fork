@@ -1,6 +1,7 @@
 package uploader
 
 import (
+	"context"
 	"sync"
 	"testing"
 	"time"
@@ -11,6 +12,7 @@ import (
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module/executiondatasync/execution_data"
 	executionDataMock "github.com/onflow/flow-go/module/executiondatasync/execution_data/mock"
+	"github.com/onflow/flow-go/module/irrecoverable"
 	"github.com/onflow/flow-go/module/mempool/entity"
 	"github.com/onflow/flow-go/module/metrics"
 
@@ -26,13 +28,15 @@ import (
 )
 
 func Test_Upload_invoke(t *testing.T) {
+	ctx, cancel := irrecoverable.NewMockSignalerContextWithCancel(t, context.Background())
+	defer cancel()
 	wg := sync.WaitGroup{}
 	uploaderCalled := false
 
 	dummyUploader := &DummyUploader{
 		f: func() error {
-			wg.Done()
 			uploaderCalled = true
+			wg.Done()
 			return nil
 		},
 	}
@@ -40,7 +44,7 @@ func Test_Upload_invoke(t *testing.T) {
 		1*time.Nanosecond, 1, zerolog.Nop(), &metrics.NoopCollector{})
 
 	testRetryableUploaderWrapper := createTestBadgerRetryableUploaderWrapper(asyncUploader)
-	defer testRetryableUploaderWrapper.Done()
+	testRetryableUploaderWrapper.Start(ctx)
 
 	// nil input - no call to Upload()
 	err := testRetryableUploaderWrapper.Upload(nil)
@@ -58,13 +62,15 @@ func Test_Upload_invoke(t *testing.T) {
 }
 
 func Test_RetryUpload(t *testing.T) {
+	ctx, cancel := irrecoverable.NewMockSignalerContextWithCancel(t, context.Background())
+	defer cancel()
 	wg := sync.WaitGroup{}
 	wg.Add(1)
 	uploaderCalled := false
 	dummyUploader := &DummyUploader{
 		f: func() error {
-			wg.Done()
 			uploaderCalled = true
+			wg.Done()
 			return nil
 		},
 	}
@@ -72,7 +78,7 @@ func Test_RetryUpload(t *testing.T) {
 		1*time.Nanosecond, 1, zerolog.Nop(), &metrics.NoopCollector{})
 
 	testRetryableUploaderWrapper := createTestBadgerRetryableUploaderWrapper(asyncUploader)
-	defer testRetryableUploaderWrapper.Done()
+	testRetryableUploaderWrapper.Start(ctx)
 
 	err := testRetryableUploaderWrapper.RetryUpload()
 	wg.Wait()
@@ -82,6 +88,8 @@ func Test_RetryUpload(t *testing.T) {
 }
 
 func Test_AsyncUploaderCallback(t *testing.T) {
+	ctx, cancel := irrecoverable.NewMockSignalerContextWithCancel(t, context.Background())
+	defer cancel()
 	wgUploadCalleded := sync.WaitGroup{}
 	wgUploadCalleded.Add(1)
 
@@ -95,7 +103,7 @@ func Test_AsyncUploaderCallback(t *testing.T) {
 		1*time.Nanosecond, 1, zerolog.Nop(), &metrics.NoopCollector{})
 
 	testRetryableUploaderWrapper := createTestBadgerRetryableUploaderWrapper(asyncUploader)
-	defer testRetryableUploaderWrapper.Done()
+	testRetryableUploaderWrapper.Start(ctx)
 
 	testComputationResult := createTestComputationResult()
 	err := testRetryableUploaderWrapper.Upload(testComputationResult)
@@ -169,7 +177,7 @@ func Test_ReconstructComputationResultFromStorage(t *testing.T) {
 	mockComputationResultStorage.On("Upsert", testBlockID, mock.Anything).Return(nil)
 
 	mockExecutionDataDowloader := new(executionDataMock.Downloader)
-	mockExecutionDataDowloader.On("Download", mock.Anything, testEDID).Return(
+	mockExecutionDataDowloader.On("Get", mock.Anything, testEDID).Return(
 		&execution_data.BlockExecutionData{
 			BlockID:             testBlockID,
 			ChunkExecutionDatas: testChunkExecutionDatas,
@@ -259,8 +267,7 @@ func createTestBadgerRetryableUploaderWrapper(asyncUploader *AsyncUploader) *Bad
 	mockComputationResultStorage.On("Upsert", mock.Anything, mock.Anything).Return(nil)
 
 	mockExecutionDataDowloader := new(executionDataMock.Downloader)
-	mockExecutionDataDowloader.On("Add", mock.Anything, mock.Anything).Return(flow.ZeroID, nil, nil)
-	mockExecutionDataDowloader.On("Download", mock.Anything, mock.Anything).Return(
+	mockExecutionDataDowloader.On("Get", mock.Anything, mock.Anything).Return(
 		&execution_data.BlockExecutionData{
 			BlockID:             flow.ZeroID,
 			ChunkExecutionDatas: make([]*execution_data.ChunkExecutionData, 0),

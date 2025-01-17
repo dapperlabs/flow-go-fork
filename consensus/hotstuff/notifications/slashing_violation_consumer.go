@@ -5,6 +5,7 @@ import (
 
 	"github.com/onflow/flow-go/consensus/hotstuff"
 	"github.com/onflow/flow-go/consensus/hotstuff/model"
+	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/utils/logging"
 )
 
@@ -23,16 +24,17 @@ func NewSlashingViolationsConsumer(log zerolog.Logger) *SlashingViolationsConsum
 		log: log,
 	}
 }
-func (c *SlashingViolationsConsumer) OnInvalidBlockDetected(err model.InvalidProposalError) {
-	block := err.InvalidProposal.Block
+func (c *SlashingViolationsConsumer) OnInvalidBlockDetected(err flow.Slashable[model.InvalidProposalError]) {
+	block := err.Message.InvalidProposal.Block
 	c.log.Warn().
 		Bool(logging.KeySuspicious, true).
+		Hex("origin_id", err.OriginID[:]).
 		Hex("proposer_id", block.ProposerID[:]).
 		Uint64("block_view", block.View).
 		Hex("block_id", block.BlockID[:]).
 		Hex("block_payloadhash", block.PayloadHash[:]).
 		Time("block_timestamp", block.Timestamp).
-		Msg("OnInvalidBlockDetected")
+		Msgf("OnInvalidBlockDetected: %s", err.Message.Error())
 }
 
 func (c *SlashingViolationsConsumer) OnDoubleVotingDetected(vote1 *model.Vote, vote2 *model.Vote) {
@@ -76,7 +78,7 @@ func (c *SlashingViolationsConsumer) OnInvalidTimeoutDetected(err model.InvalidT
 		Msg("OnInvalidTimeoutDetected")
 }
 
-func (c *SlashingViolationsConsumer) OnVoteForInvalidBlockDetected(vote *model.Vote, proposal *model.Proposal) {
+func (c *SlashingViolationsConsumer) OnVoteForInvalidBlockDetected(vote *model.Vote, proposal *model.SignedProposal) {
 	c.log.Warn().
 		Uint64("vote_view", vote.View).
 		Hex("voted_block_id", vote.BlockID[:]).

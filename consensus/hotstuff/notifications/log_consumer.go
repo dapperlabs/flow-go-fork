@@ -46,16 +46,17 @@ func (lc *LogConsumer) OnFinalizedBlock(block *model.Block) {
 		Msg("block finalized")
 }
 
-func (lc *LogConsumer) OnInvalidBlockDetected(err model.InvalidProposalError) {
-	invalidBlock := err.InvalidProposal.Block
+func (lc *LogConsumer) OnInvalidBlockDetected(err flow.Slashable[model.InvalidProposalError]) {
+	invalidBlock := err.Message.InvalidProposal.Block
 	lc.log.Warn().
 		Str(logging.KeySuspicious, "true").
+		Hex("origin_id", err.OriginID[:]).
 		Uint64("block_view", invalidBlock.View).
 		Hex("proposer_id", invalidBlock.ProposerID[:]).
 		Hex("block_id", invalidBlock.BlockID[:]).
 		Uint64("qc_block_view", invalidBlock.QC.View).
 		Hex("qc_block_id", invalidBlock.QC.BlockID[:]).
-		Msgf("invalid block detected: %s", err.Error())
+		Msgf("invalid block detected: %s", err.Message.Error())
 }
 
 func (lc *LogConsumer) OnDoubleProposeDetected(block *model.Block, alt *model.Block) {
@@ -68,7 +69,7 @@ func (lc *LogConsumer) OnDoubleProposeDetected(block *model.Block, alt *model.Bl
 		Msg("double proposal detected")
 }
 
-func (lc *LogConsumer) OnReceiveProposal(currentView uint64, proposal *model.Proposal) {
+func (lc *LogConsumer) OnReceiveProposal(currentView uint64, proposal *model.SignedProposal) {
 	logger := lc.logBasicBlockData(lc.log.Debug(), proposal.Block).
 		Uint64("cur_view", currentView)
 	lastViewTC := proposal.LastViewTC
@@ -196,7 +197,7 @@ func (lc *LogConsumer) OnInvalidVoteDetected(err model.InvalidVoteError) {
 		Msgf("invalid vote detected: %s", err.Error())
 }
 
-func (lc *LogConsumer) OnVoteForInvalidBlockDetected(vote *model.Vote, proposal *model.Proposal) {
+func (lc *LogConsumer) OnVoteForInvalidBlockDetected(vote *model.Vote, proposal *model.SignedProposal) {
 	lc.log.Warn().
 		Str(logging.KeySuspicious, "true").
 		Uint64("vote_view", vote.View).

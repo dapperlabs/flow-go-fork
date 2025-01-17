@@ -3,19 +3,13 @@ package environment
 import (
 	"fmt"
 
-	"github.com/onflow/cadence/runtime/common"
+	"github.com/onflow/cadence/common"
 
 	"github.com/onflow/flow-go/fvm/errors"
 	"github.com/onflow/flow-go/fvm/storage/state"
 	"github.com/onflow/flow-go/fvm/tracing"
 	"github.com/onflow/flow-go/model/flow"
 	"github.com/onflow/flow-go/module/trace"
-)
-
-const (
-	FungibleTokenAccountIndex = 2
-	FlowTokenAccountIndex     = 3
-	FlowFeesAccountIndex      = 4
 )
 
 type AddressGenerator interface {
